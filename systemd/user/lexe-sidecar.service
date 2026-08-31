@@ -1,0 +1,15 @@
+[Unit]
+Description=Lexe Sidecar (local Lightning node API for lexe-mcp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lexe-sidecar --listen-addr 127.0.0.1:5393
+Restart=always
+RestartSec=3
+# If you'd rather bake the credentials into the sidecar, uncomment:
+# Environment=LEXE_CLIENT_CREDENTIALS=<paste here>
+
+[Install]
+WantedBy=default.target

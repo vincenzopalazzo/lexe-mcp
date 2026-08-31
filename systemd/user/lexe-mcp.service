@@ -1,0 +1,15 @@
+[Unit]
+Description=Lexe MCP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/lexe-mcp
+ExecStart=%h/lexe-mcp/lexe-mcp
+Restart=always
+RestartSec=3
+EnvironmentFile=-%h/lexe-mcp/config.env
+
+[Install]
+WantedBy=default.target

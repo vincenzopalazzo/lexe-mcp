@@ -1,0 +1,15 @@
+{
+  "port": 8010,
+  "host": "0.0.0.0",
+  "lexeClientCredentials": "PASTE_YOUR_LEXE_CLIENT_CREDENTIALS_HERE",
+  "lexeSidecarUrl": "http://127.0.0.1:5393",
+  "agenticmail": {
+    "url": "http://127.0.0.1:3829",
+    "masterKey": "PASTE_YOUR_AGENTICMAIL_MASTER_KEY"
+  },
+  "upstreamMcpUrl": "http://127.0.0.1:8014/mcp",
+  "amountSats": 1,
+  "invoiceDescription": "AgenticMail MCP access - one-time payment, unlimited use",
+  "offerTtlSecs": 3600,
+  "stateDir": "~/.lexe-mcp"
+}

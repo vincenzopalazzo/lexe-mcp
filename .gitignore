@@ -1,0 +1,11 @@
+# secrets / local config — never commit real keys
+config.json
+config.env
+.env
+node_modules/
+*.log
+
+# compiled binaries (darwin local + linux amd64 for the VM)
+/lexe-mcp
+/lexe-mcp-linux
+
