@@ -34,10 +34,12 @@ type config struct {
 	AgenticMailURL        string
 	AgenticMailMasterKey  string
 	UpstreamMCPURL        string
+	UpstreamMCPToken      string
 	AmountSats            int
 	InvoiceDescription    string
 	OfferTTL              int
 	StateDir              string
+	PublicURL             string
 }
 
 var cfg config
@@ -132,6 +134,14 @@ func envOr(env string, fileVal any) string {
 	return asString(fileVal)
 }
 
+func looksPlaceholder(s string) bool {
+	if s == "" {
+		return true
+	}
+	u := strings.ToUpper(s)
+	return strings.Contains(u, "PASTE") || strings.Contains(u, "YOUR_") || strings.Contains(u, "CHANGEME")
+}
+
 func loadConfig() config {
 	cfgPath := os.Getenv("CONFIG_PATH")
 	if cfgPath == "" {
@@ -164,10 +174,12 @@ func loadConfig() config {
 			return nil
 		}()),
 		UpstreamMCPURL:      envOr("UPSTREAM_MCP_URL", get("upstreamMcpUrl")),
+		UpstreamMCPToken:    envOr("UPSTREAM_MCP_TOKEN", get("upstreamMcpToken")),
 		AmountSats:          envIntOrFileInt("L402_AMOUNT_SATS", get("amountSats"), 1),
 		InvoiceDescription:  asString(get("invoiceDescription")),
 		OfferTTL:            cfgInt(fmt.Sprintf("%v", get("offerTtlSecs")), 3600),
 		StateDir:            expandHome(asString(get("stateDir"))),
+		PublicURL:           strings.TrimRight(envOr("PUBLIC_URL", get("publicUrl")), "/"),
 	}
 
 	// defaults
@@ -199,11 +211,15 @@ func loadConfig() config {
 		c.StateDir = "~/.lexe-mcp"
 	}
 
-	if c.LexeClientCredentials == "" {
+	if looksPlaceholder(c.LexeClientCredentials) {
+		c.LexeClientCredentials = ""
 		log.Printf("[lexe-mcp] no server-side lexeClientCredentials — clients must send Authorization: Bearer <Lexe SDK credentials>")
 	}
 	if c.AgenticMailMasterKey == "" {
-		log.Printf("[lexe-mcp] no agenticmail.masterKey — L402 mint/proxy disabled")
+		log.Printf("[lexe-mcp] no agenticmail.masterKey — per-client account mint disabled")
+	}
+	if c.UpstreamMCPToken == "" {
+		log.Printf("[lexe-mcp] no upstreamMcpToken — L402 hop will proxy without MCP HTTP auth")
 	}
 	return c
 }
@@ -569,6 +585,13 @@ func paymentRequired(w http.ResponseWriter, reason string) {
 	if reason == "" {
 		reason = "payment_required"
 	}
+	if cfg.LexeClientCredentials == "" {
+		writeJSON(w, 503, map[string]any{
+			"error":  "L402 hop has no Lexe identity — set lexeClientCredentials (SDK client from the Lexe app) on the server",
+			"reason": reason,
+		})
+		return
+	}
 	offer, err := createOffer(cfg.InvoiceDescription, cfg.AmountSats, nil, "")
 	if err != nil {
 		writeJSON(w, 502, map[string]any{"error": err.Error()})
@@ -588,22 +611,42 @@ func paymentRequired(w http.ResponseWriter, reason string) {
 		writeJSON(w, 502, map[string]any{"error": "sidecar create_offer returned no offer: " + s})
 		return
 	}
-	body := map[string]any{
-		"scheme":   "bolt12",
-		"network":  "lightning",
-		"amount_sats": cfg.AmountSats,
-		"currency": "sats",
-		"offer":    bolt12,
-		"description": cfg.InvoiceDescription,
-		"pay_to":   "emailagent.hedwig.sh",
-		"instructions":
-			"Pay the BOLT12 offer with any Lightning wallet, then resend this request " +
-			"with header X-PAYMENT: <payment index>. The payment index is returned by your " +
-			"wallet/LN node (see lexe.check_payment tool).",
-		"retry_after_secs": 10,
-		"reason":           reason,
+	pub := cfg.PublicURL
+	if pub == "" {
+		pub = fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
 	}
-	writeJSON(w, 402, body, map[string]string{"WWW-Authenticate": "X-PAYMENT"})
+	body := map[string]any{
+		"version":               "0.2.2",
+		"scheme":                "bolt12",
+		"network":               "lightning",
+		"amount_sats":           cfg.AmountSats,
+		"currency":              "sats",
+		"offer":                 bolt12,
+		"description":           cfg.InvoiceDescription,
+		"pay_to":                "emailagent.hedwig.sh",
+		"reason":                reason,
+		"retry_after_secs":      10,
+		"payment_request_url":   pub + "/mcp",
+		"instructions":          "Pay the BOLT12 offer (lno1…) with any Lightning wallet that supports offers, then resend this request with header X-PAYMENT: <payment index> (lexe.check_payment). Discovery methods (initialize, server/discover, tools/list, lexe.*) stay unpaid.",
+		"offers": []map[string]any{
+			{
+				"id":              "bolt12-access",
+				"title":           "AgenticMail MCP access",
+				"description":     cfg.InvoiceDescription,
+				"type":            "one-time",
+				"amount":          cfg.AmountSats,
+				"currency":        "sats",
+				"payment_methods": []string{"lightning"},
+				"bolt12":          bolt12,
+			},
+		},
+		"payment_request": map[string]any{
+			"bolt12_offer": bolt12,
+		},
+	}
+	writeJSON(w, 402, body, map[string]string{
+		"WWW-Authenticate": `L402 scheme="bolt12"`,
+	})
 }
 
 // verifyProof: verify an X-PAYMENT proof (payment index).
@@ -684,7 +727,7 @@ var hopSkip = map[string]bool{
 	"upgrade": true, "proxy-connection": true,
 }
 
-func hopHeaders(r *http.Request, accountAk string) http.Header {
+func hopHeaders(r *http.Request, _ string) http.Header {
 	h := http.Header{}
 	for k, vs := range r.Header {
 		if hopSkip[strings.ToLower(k)] {
@@ -694,8 +737,14 @@ func hopHeaders(r *http.Request, accountAk string) http.Header {
 			h.Add(k, v)
 		}
 	}
-	if accountAk != "" {
-		h.Set("Authorization", "Bearer "+accountAk)
+	// Upstream agenticmail-mcp authenticates the HTTP transport with a
+	// static MCP token, not the per-client AgenticMail ak_. Always use
+	// the configured hop token when proxying.
+	if cfg.UpstreamMCPToken != "" {
+		h.Set("Authorization", "Bearer "+cfg.UpstreamMCPToken)
+	}
+	if h.Get("Accept") == "" {
+		h.Set("Accept", "application/json, text/event-stream")
 	}
 	return h
 }

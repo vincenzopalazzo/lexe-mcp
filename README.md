@@ -28,9 +28,13 @@ a Lexe id.
 ## Optional: L402 gate in front of another MCP server
 
 The same process can sit in front of an upstream MCP endpoint (we run
-`agenticmail-mcp` on `:8014`). Unauthenticated calls get HTTP `402` with a
-BOLT12 offer; after payment the client resends `X-PAYMENT`, the server
-verifies via the sidecar, mints an AgenticMail `ak_` token, and proxies.
+`agenticmail-mcp` on `:8014`). Unauthenticated non-discovery calls get
+HTTP `402` with a **BOLT12 offer** (`lno1…`, Lexe `POST /v2/node/create_offer`).
+Pay it, resend `X-PAYMENT: <payment index>`; the hop then proxies with
+`upstreamMcpToken` (the MCP HTTP Bearer that `:8014` requires — not `ak_`).
+
+BOLT12 is first-class on Lexe (reusable offer, not a single-use BOLT11
+invoice). Classic L402 macaroon+BOLT11 is **not** what this hop speaks.
 
 That deployment — L402 paywall + AgenticMail bridge — is journaled in
 [local.ai docs/43](https://github.com/vincenzopalazzo/local-ai/blob/main/docs/43-lexe-mcp-l402.md),

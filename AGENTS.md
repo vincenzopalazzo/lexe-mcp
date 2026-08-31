@@ -221,7 +221,9 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 | `host` / `HOST` | `0.0.0.0` | |
 | `agenticmail.masterKey` / `AGENTICMAIL_MASTER_KEY` | — | L402 hop only |
 | `upstreamMcpUrl` / `UPSTREAM_MCP_URL` | `http://127.0.0.1:8014/mcp` | L402 hop |
-| `amountSats` / `L402_AMOUNT_SATS` | `1` | |
+| `upstreamMcpToken` / `UPSTREAM_MCP_TOKEN` | — | L402 hop — MCP HTTP Bearer that `:8014` expects (not `ak_`) |
+| `publicUrl` / `PUBLIC_URL` | — | advertised in 402 `payment_request_url` |
+| `amountSats` / `L402_AMOUNT_SATS` | `1` | L402 hop — min sats on the BOLT12 offer |
 | `stateDir` | `~/.lexe-mcp` | |
 
 Neither credential fatals at boot. Lightning-only public host: leave both
