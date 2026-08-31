@@ -207,6 +207,7 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 | `config.json` / `config.env` | secrets — never commit |
 | `systemd/user/lexe-mcp.service` | user unit, `ExecStart=%h/lexe-mcp/lexe-mcp` |
 | `systemd/user/lexe-sidecar.service` | sidecar on `:5393` |
+| `.github/workflows/ci.yml` | `go vet` + build + `/health` + `initialize` + `OPTIONS` + `tools/list` |
 
 ## Config
 
