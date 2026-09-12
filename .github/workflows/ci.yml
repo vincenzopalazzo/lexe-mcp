@@ -18,6 +18,7 @@ jobs:
       - name: vet + build
         run: |
           go vet .
+          go test .
           go build -o lexe-mcp .
 
       - name: smoke
@@ -46,3 +47,11 @@ jobs:
             -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
             http://127.0.0.1:18010/mcp | tee /tmp/tools.json
           grep -q 'lexe.create_invoice' /tmp/tools.json
+          grep -q 'lexe.pay' /tmp/tools.json
+          grep -q 'lexe.analyze' /tmp/tools.json
+
+          curl -sf -m 3 -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lexe.pay","arguments":{"invoice":"lnbc1ci"}}}' \
+            http://127.0.0.1:18010/mcp | tee /tmp/pay.json
+          grep -q 'missing Lexe identity' /tmp/pay.json
+          grep -q '"isError":true' /tmp/pay.json

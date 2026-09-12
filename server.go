@@ -36,6 +36,7 @@ type config struct {
 	UpstreamMCPURL        string
 	UpstreamMCPToken      string
 	AmountSats            int
+	PayMaxSats            int
 	InvoiceDescription    string
 	OfferTTL              int
 	StateDir              string
@@ -49,7 +50,7 @@ const (
 	protocol202511 = "2025-11-25"
 	protocol202503 = "2025-03-26"
 	serverName     = "lexe-mcp"
-	serverVersion  = "1.0.0"
+	serverVersion  = "1.1.0"
 )
 
 var supportedVersions = []string{protocolModern, protocol202511, protocol202503}
@@ -161,7 +162,7 @@ func loadConfig() config {
 		Host:                  envOr("HOST", get("host")),
 		LexeClientCredentials: envOr("LEXE_CLIENT_CREDENTIALS", get("lexeClientCredentials")),
 		LexeSidecarURL:        strings.TrimRight(envOr("LEXE_SIDECAR_URL", get("lexeSidecarUrl")), "/"),
-		AgenticMailURL:        strings.TrimRight(envOr("AGENTICMAIL_URL", func() any {
+		AgenticMailURL: strings.TrimRight(envOr("AGENTICMAIL_URL", func() any {
 			if am != nil {
 				return am["url"]
 			}
@@ -173,13 +174,14 @@ func loadConfig() config {
 			}
 			return nil
 		}()),
-		UpstreamMCPURL:      envOr("UPSTREAM_MCP_URL", get("upstreamMcpUrl")),
-		UpstreamMCPToken:    envOr("UPSTREAM_MCP_TOKEN", get("upstreamMcpToken")),
-		AmountSats:          envIntOrFileInt("L402_AMOUNT_SATS", get("amountSats"), 1),
-		InvoiceDescription:  asString(get("invoiceDescription")),
-		OfferTTL:            cfgInt(fmt.Sprintf("%v", get("offerTtlSecs")), 3600),
-		StateDir:            expandHome(asString(get("stateDir"))),
-		PublicURL:           strings.TrimRight(envOr("PUBLIC_URL", get("publicUrl")), "/"),
+		UpstreamMCPURL:     envOr("UPSTREAM_MCP_URL", get("upstreamMcpUrl")),
+		UpstreamMCPToken:   envOr("UPSTREAM_MCP_TOKEN", get("upstreamMcpToken")),
+		AmountSats:         envIntOrFileInt("L402_AMOUNT_SATS", get("amountSats"), 1),
+		PayMaxSats:         envIntOrFileInt("LEXE_PAY_MAX_SATS", get("payMaxSats"), 0),
+		InvoiceDescription: asString(get("invoiceDescription")),
+		OfferTTL:           cfgInt(fmt.Sprintf("%v", get("offerTtlSecs")), 3600),
+		StateDir:           expandHome(asString(get("stateDir"))),
+		PublicURL:          strings.TrimRight(envOr("PUBLIC_URL", get("publicUrl")), "/"),
 	}
 
 	// defaults
@@ -234,10 +236,10 @@ type stateRec struct {
 }
 
 var (
-	stateMu    sync.Mutex
-	STATE      = map[string]stateRec{}
-	stateFile  string
-	saveTimer  *time.Timer
+	stateMu   sync.Mutex
+	STATE     = map[string]stateRec{}
+	stateFile string
+	saveTimer *time.Timer
 )
 
 func loadState() {
@@ -396,6 +398,202 @@ func updatedPayments(creds string) (map[string]any, error) {
 		return nil, err
 	}
 	return asMap(out), nil
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+func clipNote(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
+}
+
+func satsInt(v any) (int, bool) {
+	if v == nil {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		if n <= 0 {
+			return 0, false
+		}
+		return int(n), true
+	case int:
+		if n <= 0 {
+			return 0, false
+		}
+		return n, true
+	case int64:
+		if n <= 0 {
+			return 0, false
+		}
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil || i <= 0 {
+			return 0, false
+		}
+		return int(i), true
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, false
+		}
+		i, err := strconv.Atoi(s)
+		if err != nil || i <= 0 {
+			return 0, false
+		}
+		return i, true
+	}
+	return 0, false
+}
+
+func payableFromArgs(args map[string]any) string {
+	for _, k := range []string{"invoice", "offer", "payable", "payment_string"} {
+		if s := strings.TrimSpace(asString(args[k])); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func isLightningKind(kind string) bool {
+	switch strings.ToLower(kind) {
+	case "invoice", "offer", "lnurl-pay", "lnurl":
+		return true
+	}
+	return false
+}
+
+func payableEncoding(p map[string]any) string {
+	return firstString(p, "invoice", "offer", "lnurl")
+}
+
+// pickLightningPayable prefers the sidecar's recommended Lightning route
+// and skips on-chain. Empty map + error if there is nothing we will send.
+func pickLightningPayable(analyzed map[string]any) (map[string]any, error) {
+	for _, item := range asSlice(analyzed["payables"]) {
+		p := asMap(item)
+		if p == nil {
+			continue
+		}
+		if isLightningKind(asString(p["kind"])) {
+			return p, nil
+		}
+	}
+	if len(asSlice(analyzed["claimables"])) > 0 {
+		return nil, httpError{"that string is a withdraw/claim, not a payable invoice or offer"}
+	}
+	return nil, httpError{"no Lightning invoice or offer in that string (on-chain sends are not supported)"}
+}
+
+func resolvePayAmount(picked map[string]any, requested, maxSats int) (int, error) {
+	encoded, hasEncoded := satsInt(picked["amount"])
+	minA, _ := satsInt(picked["min_amount"])
+	maxA, _ := satsInt(picked["max_amount"])
+	if requested > 0 && hasEncoded && requested != encoded {
+		return 0, httpError{fmt.Sprintf("amount_sats %d does not match invoice amount %d", requested, encoded)}
+	}
+	amt := requested
+	if amt == 0 && hasEncoded {
+		amt = encoded
+	}
+	if amt == 0 {
+		return 0, httpError{"amountless invoice/offer: pass amount_sats"}
+	}
+	if maxSats > 0 && amt > maxSats {
+		return 0, httpError{fmt.Sprintf("amount %d sats exceeds payMaxSats %d", amt, maxSats)}
+	}
+	if minA > 0 && amt < minA {
+		return 0, httpError{fmt.Sprintf("amount %d sats is below the recipient min %d", amt, minA)}
+	}
+	if maxA > 0 && amt > maxA {
+		return 0, httpError{fmt.Sprintf("amount %d sats is above the recipient max %d", amt, maxA)}
+	}
+	return amt, nil
+}
+
+func analyzePaymentString(paymentString, creds string) (map[string]any, error) {
+	out, err := sidecar("GET", "/v2/node/analyze?payment_string="+url.QueryEscape(paymentString), nil, 30000, creds)
+	if err != nil {
+		return nil, err
+	}
+	m := asMap(out)
+	if m == nil {
+		return map[string]any{"raw": out}, nil
+	}
+	return m, nil
+}
+
+func sendLightningPay(picked map[string]any, amt int, note, creds string) (map[string]any, error) {
+	kind := strings.ToLower(asString(picked["kind"]))
+	raw := payableEncoding(picked)
+	if raw == "" {
+		return nil, httpError{"analyze returned a Lightning payable with no invoice/offer string"}
+	}
+	body := map[string]any{}
+	if note != "" {
+		body["personal_note"] = note
+	}
+	var path string
+	switch kind {
+	case "invoice":
+		path = "/v2/node/pay_invoice"
+		body["invoice"] = raw
+		if _, hasAmt := satsInt(picked["amount"]); !hasAmt {
+			body["fallback_amount"] = strconv.Itoa(amt)
+		}
+	case "offer":
+		path = "/v2/node/pay_offer"
+		body["offer"] = raw
+		body["amount"] = strconv.Itoa(amt)
+	case "lnurl-pay", "lnurl":
+		path = "/v2/node/pay_lnurl"
+		body["lnurl"] = raw
+		body["amount"] = strconv.Itoa(amt)
+	default:
+		return nil, httpError{"unsupported payable kind: " + kind}
+	}
+	out, err := sidecar("POST", path, body, 180000, creds)
+	if err != nil {
+		return nil, err
+	}
+	return asMap(out), nil
+}
+
+const lnproofSpaceBase = "https://lnproof.space"
+
+func payerProofLink(proof string) string {
+	proof = strings.TrimSpace(proof)
+	if !strings.HasPrefix(strings.ToLower(proof), "lnp1") {
+		return ""
+	}
+	return lnproofSpaceBase + "/" + proof
+}
+
+func createPayerProof(index, proofNote, creds string) (string, error) {
+	index = strings.TrimSpace(index)
+	if index == "" {
+		return "", httpError{"missing payment index for payer proof"}
+	}
+	body := map[string]any{"index": index}
+	if proofNote != "" {
+		body["proof_note"] = proofNote
+	}
+	out, err := sidecar("POST", "/v2/node/create_payer_proof", body, 30000, creds)
+	if err != nil {
+		return "", err
+	}
+	proof := firstString(asMap(out), "proof")
+	if proof == "" {
+		return "", httpError{"sidecar create_payer_proof returned no proof"}
+	}
+	return proof, nil
 }
 
 func paymentSettled(p map[string]any) bool {
@@ -616,18 +814,18 @@ func paymentRequired(w http.ResponseWriter, reason string) {
 		pub = fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
 	}
 	body := map[string]any{
-		"version":               "0.2.2",
-		"scheme":                "bolt12",
-		"network":               "lightning",
-		"amount_sats":           cfg.AmountSats,
-		"currency":              "sats",
-		"offer":                 bolt12,
-		"description":           cfg.InvoiceDescription,
-		"pay_to":                "emailagent.hedwig.sh",
-		"reason":                reason,
-		"retry_after_secs":      10,
-		"payment_request_url":   pub + "/mcp",
-		"instructions":          "Pay the BOLT12 offer (lno1…) with any Lightning wallet that supports offers, then resend this request with header X-PAYMENT: <payment index> (lexe.check_payment). Discovery methods (initialize, server/discover, tools/list, lexe.*) stay unpaid.",
+		"version":             "0.2.2",
+		"scheme":              "bolt12",
+		"network":             "lightning",
+		"amount_sats":         cfg.AmountSats,
+		"currency":            "sats",
+		"offer":               bolt12,
+		"description":         cfg.InvoiceDescription,
+		"pay_to":              "emailagent.hedwig.sh",
+		"reason":              reason,
+		"retry_after_secs":    10,
+		"payment_request_url": pub + "/mcp",
+		"instructions":        "Pay the BOLT12 offer (lno1…) with any Lightning wallet that supports offers, then resend this request with header X-PAYMENT: <payment index> (lexe.check_payment). Discovery methods (initialize, server/discover, tools/list, lexe.*) stay unpaid.",
 		"offers": []map[string]any{
 			{
 				"id":              "bolt12-access",
@@ -805,7 +1003,7 @@ func buildTools() []map[string]any {
 			"title":       "Check Lightning payment",
 			"description": "Check whether a payment (by index) has settled. After settlement call lexe.my_account to get your MCP Bearer token, or resend /mcp with X-PAYMENT: <index>.",
 			"inputSchema": map[string]any{
-				"type":     "object",
+				"type": "object",
 				"properties": map[string]any{
 					"index": map[string]any{"type": "string", "description": "Payment index from your wallet"},
 				},
@@ -817,7 +1015,7 @@ func buildTools() []map[string]any {
 			"title":       "Minted AgenticMail account",
 			"description": "Return the AgenticMail account + Bearer token (ak_…) minted for a settled payment index.",
 			"inputSchema": map[string]any{
-				"type":     "object",
+				"type": "object",
 				"properties": map[string]any{
 					"index": map[string]any{"type": "string", "description": "Payment index"},
 				},
@@ -829,6 +1027,34 @@ func buildTools() []map[string]any {
 			"title":       "Lexe node health",
 			"description": "Lexe sidecar / node health.",
 			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+		},
+		{
+			"name":        "lexe.analyze",
+			"title":       "Analyze invoice or offer",
+			"description": "Decode a BOLT11 invoice (lnbc…), BOLT12 offer (lno1…), or Lightning Address without sending. Returns amount/kind so you can inspect before lexe.pay.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"invoice":        map[string]any{"type": "string", "description": "BOLT11 invoice, BOLT12 offer, or Lightning Address"},
+					"offer":          map[string]any{"type": "string", "description": "Alias for invoice when the string is a BOLT12 offer"},
+					"payment_string": map[string]any{"type": "string", "description": "Alias for invoice"},
+				},
+			},
+		},
+		{
+			"name":        "lexe.pay",
+			"title":       "Pay invoice or offer",
+			"description": "Pay a Lightning invoice or offer from the caller's Lexe node. Pass the BOLT11 (lnbc…) or BOLT12 (lno1…) string. Amountless strings need amount_sats. On-chain addresses are refused. After a settled BOLT12 offer pay, also returns a payer proof (lnp1…) and proof_url on lnproof.space.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"invoice":     map[string]any{"type": "string", "description": "BOLT11 invoice (lnbc…) or BOLT12 offer (lno1…). Lightning Address also works."},
+					"offer":       map[string]any{"type": "string", "description": "Alias for invoice when paying a BOLT12 offer"},
+					"amount_sats": map[string]any{"type": "number", "description": "Sats to send. Required if the invoice/offer has no amount. Must match a fixed invoice amount."},
+					"note":        map[string]any{"type": "string", "description": "Personal note stored locally, not sent to the receiver (<=200 chars)"},
+					"proof_note":  map[string]any{"type": "string", "description": "Optional public note bound into a BOLT12 payer proof (offer pays only, <=200 chars)"},
+				},
+			},
 		},
 	}
 }
@@ -880,6 +1106,70 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 			return nil, err
 		}
 		return map[string]any{"ok": true, "health": h}, nil
+	case "lexe.analyze":
+		s := payableFromArgs(args)
+		if s == "" {
+			return nil, httpError{"missing invoice/offer string"}
+		}
+		analyzed, err := analyzePaymentString(s, creds)
+		if err != nil {
+			return nil, err
+		}
+		picked, pickErr := pickLightningPayable(analyzed)
+		out := map[string]any{"ok": pickErr == nil, "analyzed": analyzed}
+		if pickErr != nil {
+			out["error"] = pickErr.Error()
+		} else {
+			out["payable"] = picked
+		}
+		return out, nil
+	case "lexe.pay":
+		s := payableFromArgs(args)
+		if s == "" {
+			return nil, httpError{"missing invoice/offer: pass invoice or offer"}
+		}
+		analyzed, err := analyzePaymentString(s, creds)
+		if err != nil {
+			return nil, err
+		}
+		picked, err := pickLightningPayable(analyzed)
+		if err != nil {
+			return nil, err
+		}
+		amt, err := resolvePayAmount(picked, cfgInt(args["amount_sats"], 0), cfg.PayMaxSats)
+		if err != nil {
+			return nil, err
+		}
+		note := clipNote(asString(args["note"]))
+		p, err := sendLightningPay(picked, amt, note, creds)
+		if err != nil {
+			return nil, err
+		}
+		if p == nil {
+			p = map[string]any{}
+		}
+		kind := asString(picked["kind"])
+		idx := firstString(p, "index")
+		out := map[string]any{
+			"ok":      paymentSettled(p),
+			"settled": paymentSettled(p),
+			"index":   idx,
+			"status":  asString(p["status"]),
+			"amount":  amt,
+			"kind":    kind,
+			"payment": p,
+		}
+		if strings.EqualFold(kind, "offer") && paymentSettled(p) {
+			proof, perr := createPayerProof(idx, clipNote(asString(args["proof_note"])), creds)
+			if perr != nil {
+				log.Printf("[lexe-mcp] create_payer_proof %s: %v", idx, perr)
+				out["proof_error"] = perr.Error()
+			} else {
+				out["proof"] = proof
+				out["proof_url"] = payerProofLink(proof)
+			}
+		}
+		return out, nil
 	default:
 		return nil, fmt.Errorf("unknown tool %s", name)
 	}
@@ -943,13 +1233,13 @@ func toolsListResult() map[string]any {
 
 func discoverResult() map[string]any {
 	return map[string]any{
-		"resultType":       "complete",
+		"resultType":        "complete",
 		"supportedVersions": supportedVersions,
-		"capabilities":     map[string]any{"tools": map[string]any{}},
-		"_meta":            serverMeta(),
-		"instructions":     paywallInstructions,
-		"ttlMs":            3600000,
-		"cacheScope":       "public",
+		"capabilities":      map[string]any{"tools": map[string]any{}},
+		"_meta":             serverMeta(),
+		"instructions":      paywallInstructions,
+		"ttlMs":             3600000,
+		"cacheScope":        "public",
 	}
 }
 

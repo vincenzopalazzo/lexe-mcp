@@ -112,7 +112,7 @@ from the optional L402 hop and still proxy upstream.
 
 If the request has no Bearer and the server has no
 `lexeClientCredentials` in config, `lexe.create_invoice` /
-`lexe.check_payment` fail with `missing Lexe identity`.
+`lexe.pay` / `lexe.check_payment` fail with `missing Lexe identity`.
 
 ### Goose
 
@@ -190,9 +190,13 @@ These work **without** L402 so a client can discover and pay:
 | Name | Args | Result |
 |---|---|---|
 | `lexe.create_invoice` | `description?`, `amount_sats?` | BOLT12 offer string |
+| `lexe.pay` | `invoice` or `offer`, `amount_sats?`, `note?`, `proof_note?` | `{settled, index, payment}` and, for settled offer pays, `proof` (`lnp1…`) + `proof_url` (`https://lnproof.space/lnp1…`) |
+| `lexe.analyze` | `invoice` or `offer` | decoded amount/kind, no send |
 | `lexe.check_payment` | `index` | `{settled, payment}` |
 | `lexe.my_account` | `index` | `{email, bearer_token}` after settlement |
 | `lexe.node_health` | — | sidecar health |
+
+`lexe.pay` is the “pay this invoice `<lnbc…|lno1…>`” tool. It analyzes first, refuses on-chain, then calls sidecar `pay_invoice` / `pay_offer` / `pay_lnurl`. Amountless strings need `amount_sats`. Optional `payMaxSats` / `LEXE_PAY_MAX_SATS` (0 = no cap). After a settled BOLT12 offer, it calls `create_payer_proof` and returns the lnproof.space link; a proof failure does not undo the payment (`proof_error` is set). Sidecar failures and missing identity are `isError: true`.
 
 Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 `resultType: "complete"` + `content[]` + `structuredContent`.
@@ -224,6 +228,7 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 | `upstreamMcpToken` / `UPSTREAM_MCP_TOKEN` | — | L402 hop — MCP HTTP Bearer that `:8014` expects (not `ak_`) |
 | `publicUrl` / `PUBLIC_URL` | — | advertised in 402 `payment_request_url` |
 | `amountSats` / `L402_AMOUNT_SATS` | `1` | L402 hop — min sats on the BOLT12 offer |
+| `payMaxSats` / `LEXE_PAY_MAX_SATS` | `0` | outbound `lexe.pay` cap; `0` = no cap |
 | `stateDir` | `~/.lexe-mcp` | |
 
 Neither credential fatals at boot. Lightning-only public host: leave both

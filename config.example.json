@@ -11,6 +11,7 @@
   "upstreamMcpToken": "PASTE_AGENTICMAIL_MCP_HTTP_TOKEN",
   "publicUrl": "https://emailagent.hedwig.sh",
   "amountSats": 1,
+  "payMaxSats": 0,
   "invoiceDescription": "AgenticMail MCP access - one-time payment, unlimited use",
   "offerTtlSecs": 3600,
   "stateDir": "~/.lexe-mcp"

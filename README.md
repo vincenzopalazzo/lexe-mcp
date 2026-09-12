@@ -11,6 +11,8 @@ and exposes Lightning as MCP tools:
 | Tool | What it does |
 |---|---|
 | `lexe.create_invoice` | Create a reusable BOLT12 offer (min amount in sats) |
+| `lexe.pay` | Pay a BOLT11 invoice (`lnbc…`) or BOLT12 offer (`lno1…`) from the caller's node. Offer pays also return a payer proof + `https://lnproof.space/lnp1…` |
+| `lexe.analyze` | Decode an invoice/offer without sending |
 | `lexe.check_payment` | Look up a payment by index; report settled or not |
 | `lexe.my_account` | After settlement, return the minted access token |
 | `lexe.node_health` | Sidecar / node health |
