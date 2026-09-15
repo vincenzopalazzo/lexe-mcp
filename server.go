@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // lexe-mcp — MCP server for Lexe Lightning (optional L402 hop).
 // Single file, stdlib only.
 package main
