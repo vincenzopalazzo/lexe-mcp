@@ -492,7 +492,10 @@ func nodeCall(method, path string, body any, timeoutMs int, creds string) (any, 
 		return nil, httpError{"node request: " + redactTLS(err)}
 	}
 	defer resp.Body.Close()
-	text, _ := io.ReadAll(resp.Body)
+	text, readErr := io.ReadAll(resp.Body)
+	if readErr != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil, httpError{"node response read: " + redactTLS(readErr)}
+	}
 	var out any
 	if len(text) > 0 {
 		if err := json.Unmarshal(text, &out); err != nil {
@@ -541,6 +544,8 @@ func createOffer(description string, minAmountSats int, ttlSecs any, creds strin
 	return asMap(out), nil
 }
 
+var errPaymentNotFound = httpError{"payment not found"}
+
 func getPayment(index string, creds string) (map[string]any, error) {
 	id, err := paymentIDFromIndex(index)
 	if err != nil {
@@ -557,7 +562,7 @@ func getPayment(index string, creds string) (map[string]any, error) {
 	if p := asMap(m["maybe_payment"]); p != nil {
 		return p, nil
 	}
-	return nil, httpError{"payment not found"}
+	return nil, errPaymentNotFound
 }
 
 func asSlice(v any) []any {
@@ -779,31 +784,40 @@ func bolt11AmountSats(invoice string) (int, bool) {
 	if err != nil || n == 0 {
 		return 0, false
 	}
+	// 21M BTC in sats is the chain limit; anything beyond is invalid input.
+	const maxSats = uint64(21000000) * 100000000
+	if n > maxSats {
+		return 0, false
+	}
+	safe := func(sats uint64) (int, bool) {
+		if sats > maxSats || sats > uint64(^uint(0)>>1) {
+			return 0, false
+		}
+		return int(sats), sats > 0
+	}
 	switch mult {
 	case 0:
-		if n > uint64(math_MaxInt64)/1e8 {
+		if n > maxSats/100000000 {
 			return 0, false
 		}
-		return int(n) * 100000000, true
+		return safe(n * 100000000)
 	case 'm':
-		if n > uint64(math_MaxInt64)/1e5 {
+		if n > maxSats/100000 {
 			return 0, false
 		}
-		return int(n) * 100000, true
+		return safe(n * 100000)
 	case 'u':
-		if n > uint64(math_MaxInt64)/1e2 {
+		if n > maxSats/100 {
 			return 0, false
 		}
-		return int(n) * 100, true
+		return safe(n * 100)
 	case 'n':
-		return int(n / 10), n >= 10
+		return safe(n / 10)
 	case 'p':
-		return int(n / 10000), false // sub-sat precision — treat as amountless
+		return 0, false // sub-sat precision — treat as amountless
 	}
 	return 0, false
 }
-
-const math_MaxInt64 = int64(^uint64(0) >> 1)
 
 func isLightningAddress(s string) bool {
 	at := strings.IndexByte(s, '@')
@@ -870,9 +884,9 @@ func sendLightningPay(picked map[string]any, amt int, note, creds string) (map[s
 			return nil, err
 		}
 		createdAt = int64(toInt64(asMap(out)["created_at"]))
-		payment, err := waitPaymentByCreated(createdAt, creds)
+		payment, err := waitPaymentByCreated(createdAt, amt, creds)
 		if err != nil {
-			return nil, err
+			return nil, httpError{fmt.Sprintf("invoice payment submitted at %d but %s", createdAt, err.Error())}
 		}
 		return payment, nil
 	case "offer":
@@ -898,12 +912,18 @@ func sendLightningPay(picked map[string]any, amt int, note, creds string) (map[s
 
 	payment, err := waitPaymentByID(paymentID, creds)
 	if err != nil {
-		return nil, err
+		// The payment was submitted; surface the index so the caller can
+		// poll lexe.check_payment instead of blind-retrying lexe.pay.
+		return map[string]any{
+			"index":  paymentIndex(createdAt, paymentID),
+			"status": "unknown",
+			"error":  err.Error(),
+		}, nil
 	}
 	if payment == nil {
 		return map[string]any{
-			"index":      paymentIndex(createdAt, paymentID),
-			"status":     "pending",
+			"index":  paymentIndex(createdAt, paymentID),
+			"status": "pending",
 		}, nil
 	}
 	return payment, nil
@@ -934,7 +954,7 @@ func waitPaymentByID(id, creds string) (map[string]any, error) {
 	return waitPayment(func() (map[string]any, error) {
 		p, err := getPayment("0-"+id, creds)
 		if err != nil {
-			if strings.Contains(err.Error(), "not found") {
+			if err == errPaymentNotFound {
 				return nil, nil // registered, not visible yet — keep polling
 			}
 			return nil, err
@@ -945,7 +965,9 @@ func waitPaymentByID(id, creds string) (map[string]any, error) {
 
 // waitPaymentByCreated finds an invoice payment by its registration time via
 // payments/updated (the invoice payment id is derived inside the node).
-func waitPaymentByCreated(createdAt int64, creds string) (map[string]any, error) {
+// Matching: created_at + outbound + invoice kind + amount — a same-ms
+// collision from another payment must also match all of those.
+func waitPaymentByCreated(createdAt int64, amt int, creds string) (map[string]any, error) {
 	minID := "ln_" + strings.Repeat("0", 64)
 	start := fmt.Sprintf("u%019d-%s", createdAt-1, minID)
 	return waitPayment(func() (map[string]any, error) {
@@ -959,25 +981,38 @@ func waitPaymentByCreated(createdAt int64, creds string) (map[string]any, error)
 			if p == nil {
 				continue
 			}
-			if toInt64(p["created_at"]) == createdAt &&
-				strings.Contains(strings.ToLower(asString(p["direction"])), "outbound") {
-				return p, nil
+			if toInt64(p["created_at"]) != createdAt {
+				continue
 			}
+			if !strings.Contains(strings.ToLower(asString(p["direction"])), "outbound") {
+				continue
+			}
+			if k := strings.ToLower(asString(p["kind"])); k != "" && k != "invoice" {
+				continue
+			}
+			if s, ok := satsInt(p["amount"]); ok && s != amt {
+				continue
+			}
+			return p, nil
 		}
 		return nil, nil // registered, not visible yet — keep polling
 	})
 }
 
+// waitPayment polls until completed|failed or the ~150 s deadline. Poll
+// ERRORS are tolerated (recorded, retried): once a payment is submitted the
+// money may move regardless, so a transient network error must not surface
+// as a bare failure an agent would "retry" with a second payment.
 func waitPayment(poll func() (map[string]any, error)) (map[string]any, error) {
 	deadline := time.Now().Add(150 * time.Second)
 	wait := 250 * time.Millisecond
 	const maxWait = 4 * time.Second
+	var lastErr error
 	for {
 		p, err := poll()
 		if err != nil {
-			return nil, err
-		}
-		if p != nil {
+			lastErr = err
+		} else if p != nil {
 			s := strings.ToLower(asString(p["status"]))
 			if s == "completed" || s == "failed" {
 				return p, nil
@@ -986,6 +1021,9 @@ func waitPayment(poll func() (map[string]any, error)) (map[string]any, error) {
 		if time.Now().After(deadline) {
 			if p != nil {
 				return p, nil // pending past the deadline
+			}
+			if lastErr != nil {
+				return nil, httpError{"payment status unknown (submitted; poll error: " + lastErr.Error() + ") — do NOT blind-retry lexe.pay; check lexe.check_payment when you have the index"}
 			}
 			return nil, httpError{"payment did not settle within 150 s (it may still settle — check with lexe.check_payment)"}
 		}
@@ -1494,6 +1532,7 @@ func handleMCP(w http.ResponseWriter, r *http.Request) {
 	// Every JSON-RPC request dispatches; tools that need the caller's node
 	// read the per-request Bearer identity inside the tool handler.
 	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MiB cap
 		raw, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeJSON(w, 400, jsonRPCErr(nil, -32700, "failed to read body", nil))
@@ -1640,8 +1679,11 @@ func main() {
 	TOOLS = buildTools()
 
 	srv := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler: router(),
+		Addr:              fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		Handler:           router(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second, // request read only; tool waits happen after
+		IdleTimeout:       120 * time.Second,
 	}
 
 	go func() {

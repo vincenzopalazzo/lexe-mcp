@@ -185,3 +185,20 @@ func TestPaymentIndex(t *testing.T) {
 		t.Fatalf("full: %q", got)
 	}
 }
+
+func TestBolt11AmountBounds(t *testing.T) {
+	// absurd magnitudes must not overflow into plausible amounts
+	cases := []string{
+		"lnbc99999999999999999999991px", // > maxSats digits
+		"lnbc99999999999m1px",           // 1e11 * 1e5 sats = 1e16 > 2.1e15 cap
+	}
+	for _, c := range cases {
+		if sats, ok := bolt11AmountSats(c); ok {
+			t.Errorf("bolt11AmountSats(%q) = (%d, true), want rejected", c, sats)
+		}
+	}
+	// boundary: exactly 21M BTC
+	if sats, ok := bolt11AmountSats("lnbc21000000000m1px"); !ok || sats != 2100000000000000 {
+		t.Fatalf("21M BTC = (%d, %v)", sats, ok)
+	}
+}
