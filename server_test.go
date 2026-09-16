@@ -82,3 +82,123 @@ func TestPayerProofLink(t *testing.T) {
 		t.Fatal("expected empty for empty")
 	}
 }
+
+// ---------- v2: local analysis ----------
+
+func TestClassifyPayable(t *testing.T) {
+	cases := []struct {
+		in   string
+		kind string
+	}{
+		{"lnbc10u1pxyz", "invoice"},       // 1000 sats
+		{"lntb1qxyz", "invoice"},          // testnet amountless
+		{"LNBC1M1XYZ", "invoice"},         // uppercase hrpart
+		{"lno1qxyz", "offer"},             // BOLT12
+		{"lnurl1dp68gurn8ghjum9vdjj", "lnurl-pay"},
+		{"user@domain.com", "lnurl-pay"},  // lightning address
+		{"bc1qexampleaddress", "onchain"}, // bech32
+		{"1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2", "onchain"},
+	}
+	for _, c := range cases {
+		_, kind := classifyPayable(c.in)
+		if kind != c.kind {
+			t.Errorf("classifyPayable(%q) = %q, want %q", c.in, kind, c.kind)
+		}
+	}
+	if _, kind := classifyPayable("hello world"); kind != "" {
+		t.Errorf("garbage classified as %q", kind)
+	}
+}
+
+func TestBolt11AmountSats(t *testing.T) {
+	cases := []struct {
+		in     string
+		sats   int
+		hasAmt bool
+	}{
+		{"lnbc10u1px", 1000, true},    // 10 micro-BTC
+		{"lnbc1m1px", 100000, true},   // 1 milli-BTC
+		{"lnbc20n1px", 2, true},       // 20 nano-BTC
+		{"lnbc1px", 0, false},         // amountless
+		{"lnbc1p1px", 0, false},       // pico — sub-sat, treated amountless
+		{"lnbc1231px", 12300000000, true}, // 123 BTC
+		{"lntb5u1px", 500, true},      // testnet 5 micro
+	}
+	for _, c := range cases {
+		sats, ok := bolt11AmountSats(c.in)
+		if sats != c.sats || ok != c.hasAmt {
+			t.Errorf("bolt11AmountSats(%q) = (%d, %v), want (%d, %v)", c.in, sats, ok, c.sats, c.hasAmt)
+		}
+	}
+}
+
+func TestAnalyzePaymentString(t *testing.T) {
+	m, err := analyzePaymentString("lnbc10u1pabc", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	picked, err := pickLightningPayable(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asString(picked["kind"]) != "invoice" || asString(picked["invoice"]) != "lnbc10u1pabc" {
+		t.Fatalf("picked %#v", picked)
+	}
+	amt, ok := satsInt(picked["amount"])
+	if !ok || amt != 1000 {
+		t.Fatalf("amount = %v", picked["amount"])
+	}
+	// on-chain → refusal
+	if _, err := pickLightningPayable(mustAnalyze(t, "bc1qxyz")); err == nil {
+		t.Fatal("expected on-chain refusal")
+	}
+}
+
+func mustAnalyze(t *testing.T, s string) map[string]any {
+	t.Helper()
+	m, err := analyzePaymentString(s, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestPaymentIDFromIndex(t *testing.T) {
+	id, err := paymentIDFromIndex("0002683862736062841-ln_3ddcab")
+	if err != nil || id != "ln_3ddcab" {
+		t.Fatalf("got %q err %v", id, err)
+	}
+	if _, err := paymentIDFromIndex("nodash"); err == nil {
+		t.Fatal("expected error")
+	}
+	if _, err := paymentIDFromIndex("-leading"); err == nil {
+		t.Fatal("expected error for leading dash")
+	}
+}
+
+func TestPaymentIndex(t *testing.T) {
+	got := paymentIndex(2683862736062841, "fs_ab")
+	if len(got) != 19+1+len("fs_ab") || got[:19] != "0002683862736062841" {
+		t.Fatalf("got %q", got)
+	}
+	if got != "0002683862736062841-fs_ab" {
+		t.Fatalf("full: %q", got)
+	}
+}
+
+func TestBolt11AmountBounds(t *testing.T) {
+	// absurd magnitudes must not overflow into plausible amounts
+	cases := []string{
+		"lnbc99999999999999999999991px", // > maxSats digits
+		"lnbc99999999999m1px",           // 1e11 * 1e5 sats = 1e16 > 2.1e15 cap
+	}
+	for _, c := range cases {
+		if sats, ok := bolt11AmountSats(c); ok {
+			t.Errorf("bolt11AmountSats(%q) = (%d, true), want rejected", c, sats)
+		}
+	}
+	// boundary: exactly 21M BTC
+	if sats, ok := bolt11AmountSats("lnbc21000000000m1px"); !ok || sats != 2100000000000000 {
+		t.Fatalf("21M BTC = (%d, %v)", sats, ok)
+	}
+}

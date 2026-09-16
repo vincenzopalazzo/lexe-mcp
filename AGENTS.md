@@ -1,18 +1,29 @@
-# AGENTS.md — lexe-mcp
+AGENTS.md — lexe-mcp
 
 Operating manual for humans and coding agents. Read this before touching
 the tree or wiring the server into a client.
 
 ## What this is
 
-Stdlib-only Go MCP server for a local [lexe-sidecar](https://github.com/lexe)
-(`127.0.0.1:5393`). Dual-era Streamable HTTP:
+Stdlib-only Go MCP server that exposes a [Lexe](https://github.com/lexe)
+Lightning node to AI agents. Dual-era Streamable HTTP:
 
 - **Modern** `2026-07-28` — `server/discover`, `_meta` + `MCP-Protocol-Version`
 - **Legacy** `2025-03-26` / `2025-11-25` — `initialize` handshake
 
-Single file: `server.go`. No Node, no extra modules. Optional L402 hop in
-front of another MCP server is documented in
+Single file: `server.go`. No Node, no extra modules.
+
+Since v2 there is **no lexe-sidecar**: the server contains a direct Lexe
+gateway client mirroring `lexe-node-client` from
+[lexe-public](https://github.com/lexe-app/lexe-public) (MIT, pinned reading
+commit `bcabbd3`): outer TLS pinned to the embedded Lexe root CA
+(prod/staging, valid to 2034), `CONNECT run.lexe.app:443` with
+`Proxy-Authorization: Bearer <lexe_auth_token>` from the caller's SDK
+credentials, inner mTLS presenting the credentials' revocable client
+certificate and verifying the node certificate against the credentials'
+ephemeral CA (or the Lexe CA). Node commands are JSON REST; amounts are
+**sats** (Lexe Decimal `Amount`). The optional L402/AgenticMail hop was
+removed in v2; that deployment is journaled in
 [local.ai docs/43](https://github.com/vincenzopalazzo/local-ai/blob/main/docs/43-lexe-mcp-l402.md)
 — do not treat that as this repo's identity.
 
@@ -21,7 +32,7 @@ Live instance: `https://emailagent.hedwig.sh/mcp`.
 ## Hard rules
 
 1. **No secrets in git.** `config.json` and `config.env` are gitignored.
-   Real Lexe SDK credentials and AgenticMail `mk_` keys stay on the host.
+   Real Lexe SDK credentials stay on the host.
 2. **Stdlib only.** Do not add a `go.mod` dependency.
 3. **Do not vendor this tree into local.ai.** That repo journals the L402
    deployment; this repo is the server.
@@ -35,35 +46,28 @@ Needs Go ≥ 1.23 to **build**. Runtime is a static binary.
 ```bash
 git clone git@github.com:vincenzopalazzo/lexe-mcp.git
 cd lexe-mcp
-cp config.example.json config.json
-# set lexeClientCredentials (Lexe app → Menu → SDK clients → Create)
-# optional L402 hop: agenticmail.masterKey + upstreamMcpUrl
-
+cp config.example.json config.json   # optional; clients can send Bearer per request
 go build -o lexe-mcp .
 ./lexe-mcp
 ```
 
-Linux amd64 (agenticmail VM):
+Linux amd64:
 
 ```bash
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o lexe-mcp-linux .
-install -m 0755 lexe-mcp-linux ~/lexe-mcp/lexe-mcp
 ```
-
-Sidecar must already be listening on `127.0.0.1:5393`.
 
 ### systemd (user unit, no sudo)
 
-Units assume the binary and config live in `~/lexe-mcp/`.
+The unit assumes the binary and config live in `~/lexe-mcp/`.
 
 ```bash
 mkdir -p ~/lexe-mcp ~/.config/systemd/user
-cp lexe-mcp ~/lexe-mcp/lexe-mcp          # the binary
-cp config.json config.env ~/lexe-mcp/    # if you use them
-cp systemd/user/lexe-mcp.service     ~/.config/systemd/user/
-cp systemd/user/lexe-sidecar.service ~/.config/systemd/user/
+cp lexe-mcp ~/lexe-mcp/lexe-mcp
+cp config.json config.env ~/lexe-mcp/ 2>/dev/null || true
+cp systemd/user/lexe-mcp.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now lexe-sidecar lexe-mcp
+systemctl --user enable --now lexe-mcp
 curl -sS localhost:8010/health
 ```
 
@@ -82,37 +86,27 @@ curl -sS -H 'content-type: application/json' \
 ## Install it in an MCP client
 
 Transport is **Streamable HTTP**. The MCP endpoint is `POST /mcp`
-(not stdio, not SSE). Public URL if you do not run a local sidecar:
+(not stdio, not SSE).
 
 ```
-https://emailagent.hedwig.sh/mcp
-```
-
-Local:
-
-```
-http://127.0.0.1:8010/mcp
+https://emailagent.hedwig.sh/mcp      # public
+http://127.0.0.1:8010/mcp             # local
 ```
 
 ### Auth — Lexe identity as Bearer
 
-Public `/mcp` is unauthenticated for discovery (`server/discover`,
-`initialize`, `tools/list`). **Tool calls that hit Lightning** need a Lexe
-identity. Send the SDK client credentials (Lexe app → Menu → SDK clients)
-as a Bearer token. That identity is forwarded to the sidecar per request,
-so you can expose this host without baking *your* node key into the
-server:
+`/mcp` is unauthenticated for discovery (`server/discover`, `initialize`,
+`tools/list`) and `lexe.analyze`. Everything else hits the **caller's own
+node** and needs that caller's Lexe SDK credentials (Lexe app → Menu → SDK
+clients) as a Bearer token:
 
 ```
 Authorization: Bearer <lexeClientCredentials>
 ```
 
-`ak_…` tokens are **not** Lexe ids — they are minted AgenticMail keys
-from the optional L402 hop and still proxy upstream.
-
-If the request has no Bearer and the server has no
-`lexeClientCredentials` in config, `lexe.create_invoice` /
-`lexe.pay` / `lexe.check_payment` fail with `missing Lexe identity`.
+The blob is parsed per request (long-lived proxy token + mTLS certificate
+material) so a public host never holds a node key and callers only reach
+their own node. `lexeClientCredentials` in config is only a fallback.
 
 ### Goose
 
@@ -130,15 +124,7 @@ extensions:
       Authorization: Bearer PASTE_YOUR_LEXE_CLIENT_CREDENTIALS
 ```
 
-For a local sidecar, set `uri: http://127.0.0.1:8010/mcp`. Omit `headers`
-if the server already has `lexeClientCredentials` in `config.json`.
-
-Goose 1.x also accepts a custom provider-style MCP entry; the field that
-matters is `type: streamable_http` + `uri`. Do not use `npx` / `command`.
-
 ### Claude Desktop / Claude Code
-
-Claude Desktop → Settings → Connectors (or `claude_desktop_config.json`):
 
 ```json
 {
@@ -154,12 +140,7 @@ Claude Desktop → Settings → Connectors (or `claude_desktop_config.json`):
 }
 ```
 
-Older clients that only speak stdio cannot attach to this server. Use a
-Streamable HTTP–capable client (Claude Desktop 2026+, Goose, Cursor).
-
 ### Cursor
-
-Cursor Settings → MCP → Add new global MCP server:
 
 ```json
 {
@@ -180,23 +161,24 @@ Cursor Settings → MCP → Add new global MCP server:
 npx @modelcontextprotocol/inspector --transport http --url https://emailagent.hedwig.sh/mcp
 ```
 
-Inspector protocol-era toggle: this server is dual-era. Prefer `2026-07-28`
-(`server/discover`); legacy `initialize` still works.
-
-## Tools (unpaid surface)
-
-These work **without** L402 so a client can discover and pay:
+## Tools (all need the caller's identity unless noted)
 
 | Name | Args | Result |
 |---|---|---|
 | `lexe.create_invoice` | `description?`, `amount_sats?` | BOLT12 offer string |
 | `lexe.pay` | `invoice` or `offer`, `amount_sats?`, `note?`, `proof_note?` | `{settled, index, payment}` and, for settled offer pays, `proof` (`lnp1…`) + `proof_url` (`https://lnproof.space/lnp1…`) |
-| `lexe.analyze` | `invoice` or `offer` | decoded amount/kind, no send |
+| `lexe.analyze` | `invoice` or `offer` | local decode: amount/kind, no send, no identity needed |
 | `lexe.check_payment` | `index` | `{settled, payment}` |
-| `lexe.my_account` | `index` | `{email, bearer_token}` after settlement |
-| `lexe.node_health` | — | sidecar health |
+| `lexe.node_health` | — | node info (version, balances, channels) over the gateway |
 
-`lexe.pay` is the “pay this invoice `<lnbc…|lno1…>`” tool. It analyzes first, refuses on-chain, then calls sidecar `pay_invoice` / `pay_offer` / `pay_lnurl`. Amountless strings need `amount_sats`. Optional `payMaxSats` / `LEXE_PAY_MAX_SATS` (0 = no cap). After a settled BOLT12 offer, it calls `create_payer_proof` and returns the lnproof.space link; a proof failure does not undo the payment (`proof_error` is set). Sidecar failures and missing identity are `isError: true`.
+`lexe.pay` analyzes locally first, refuses on-chain and LNURL, then calls
+the node `pay_invoice` / `pay_offer` and polls `payments/id` /
+`payments/updated` (250 ms → 4 s backoff, ~150 s cap) until
+`completed|failed`. Offer pays generate the `cid` client-side (32 random
+bytes) and mint a payer proof after settlement; a proof failure sets
+`proof_error` and does not undo the payment. Optional `payMaxSats` /
+`LEXE_PAY_MAX_SATS` (0 = no cap). Gateway/node failures and missing
+identity are `isError: true` results, not JSON-RPC errors.
 
 Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 `resultType: "complete"` + `content[]` + `structuredContent`.
@@ -205,13 +187,14 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 
 | Path | Role |
 |---|---|
-| `server.go` | the whole server |
-| `go.mod` | `module lexe-mcp`, Go 1.23, no require |
+| `server.go` | the whole server (MCP layer + direct gateway client) |
+| `server_test.go` | unit tests (amounts, classification, index format) |
+| `gateway_test.go` | hermetic fake-gateway + fake-node TLS integration tests |
+| `go.mod` | `module github.com/vincenzopalazzo/lexe-mcp`, Go 1.23, no require |
 | `config.example.json` | committed skeleton |
 | `config.json` / `config.env` | secrets — never commit |
 | `systemd/user/lexe-mcp.service` | user unit, `ExecStart=%h/lexe-mcp/lexe-mcp` |
-| `systemd/user/lexe-sidecar.service` | sidecar on `:5393` |
-| `.github/workflows/ci.yml` | `go vet` + build + `/health` + `initialize` + `OPTIONS` + `tools/list` |
+| `.github/workflows/ci.yml` | `go vet` + test + build + smoke (`/health`, `initialize`, `OPTIONS`, `tools/list`, identity guard on `lexe.pay`) |
 
 ## Config
 
@@ -219,20 +202,14 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 
 | Key / env | Default | Required |
 |---|---|---|
+| `lexeNetwork` / `LEXE_NETWORK` | `mainnet` | picks gateway + embedded CA (`testnet3` → staging) |
 | `lexeClientCredentials` / `LEXE_CLIENT_CREDENTIALS` | — | fallback only — clients can send `Authorization: Bearer` instead |
-| `lexeSidecarUrl` / `LEXE_SIDECAR_URL` | `http://127.0.0.1:5393` | |
 | `port` / `PORT` | `8010` | |
 | `host` / `HOST` | `0.0.0.0` | |
-| `agenticmail.masterKey` / `AGENTICMAIL_MASTER_KEY` | — | L402 hop only |
-| `upstreamMcpUrl` / `UPSTREAM_MCP_URL` | `http://127.0.0.1:8014/mcp` | L402 hop |
-| `upstreamMcpToken` / `UPSTREAM_MCP_TOKEN` | — | L402 hop — MCP HTTP Bearer that `:8014` expects (not `ak_`) |
-| `publicUrl` / `PUBLIC_URL` | — | advertised in 402 `payment_request_url` |
-| `amountSats` / `L402_AMOUNT_SATS` | `1` | L402 hop — min sats on the BOLT12 offer |
 | `payMaxSats` / `LEXE_PAY_MAX_SATS` | `0` | outbound `lexe.pay` cap; `0` = no cap |
-| `stateDir` | `~/.lexe-mcp` | |
+| `invoiceDescription` / `offerTtlSecs` | `Lightning payment` / `3600` | offer defaults |
 
-Neither credential fatals at boot. Lightning-only public host: leave both
-empty and require clients to send their Lexe SDK credentials as Bearer.
+No credential fatals at boot.
 
 ## Coding notes
 
@@ -242,12 +219,19 @@ empty and require clients to send their Lexe SDK credentials as Bearer.
 - Header/body mismatch → `-32020`. Unknown version → `-32022`.
 - `OPTIONS /mcp` must be `204` (CORS). Handle it in `handleMCP` **and** `withCORS`.
 - JSON-RPC parse errors → `-32700` / HTTP 400. Unknown tool → `-32602`.
-- Tool errors that are sidecar failures are `isError: true` results, not JSON-RPC errors.
+- Tool errors that are gateway/node failures are `isError: true` results, not JSON-RPC errors.
 - Do not add SSE `subscriptions/listen` unless we advertise `listChanged`.
 - Cross-compile on the Mac; github.com may be unreachable from some hosts.
+- Gateway client invariants (pinned by `gateway_test.go`): outer TLS trusts
+  ONLY the embedded Lexe CA; CONNECT carries `Proxy-Authorization: Bearer`
+  from the **caller's** blob; inner TLS presents the caller's client cert
+  and chains the node cert to the caller's eph CA or the Lexe CA; node
+  amounts are sats strings; never log or echo credential material.
 
 ## Don't
 
 - Commit `config.json`, `config.env`, or binaries (`/lexe-mcp`, `/lexe-mcp-linux`).
 - Ask for the Lexe SDK credential in chat; hand a one-liner to paste locally.
 - Point Goose `auto` at this URL — pin `lexe` / the http transport.
+- Add LNURL support by hand-rolling bech32 + LNURL validation in the payment
+  path without a dedicated review — resolve to BOLT11 instead (current v2 stance).
