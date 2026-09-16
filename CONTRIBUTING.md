@@ -21,7 +21,7 @@ below keep it that way.
    - header/body mismatch → `-32020`
    - unknown protocol version → `-32022`
    - unknown tool → `-32602`
-   - sidecar failures inside a tool → `isError: true` result, not a JSON-RPC error
+   - gateway/node failures inside a tool → `isError: true` result, not a JSON-RPC error
    - `ping` on modern era → HTTP 404 + `-32601`; on legacy → `{}`
 5. **Don't add SSE `subscriptions/listen`** unless we advertise `listChanged`.
 
@@ -44,5 +44,5 @@ preflight, `tools/list`, and that `lexe.pay` without credentials returns
 - Conventional-ish prefixes: `feat:`, `fix:`, `ci:`, `docs:`.
 - Include a test when you touch protocol handling, amount resolution, or
   payment/proof logic.
-- A PR that needs a local sidecar to demonstrate should include curl
-  commands the reviewer can run.
+- A PR that needs the live gateway to demonstrate should include curl
+  commands the reviewer can run with their own SDK credentials.
