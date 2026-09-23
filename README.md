@@ -159,6 +159,21 @@ Header/body mismatches → `400` + `-32020`. Unknown protocol version → `400` 
   refused by `lexe.pay` — resolve them to a BOLT11 invoice first.
 - `lexe.analyze` is a local decode; it no longer requires an identity.
 
+## Docker
+
+Published to GitHub Container Registry on version tags
+(`linux/amd64` and `linux/arm64`):
+
+```bash
+docker run --rm -p 8010:8010 ghcr.io/vincenzopalazzo/lexe-mcp:0.2
+curl -sS localhost:8010/health
+```
+
+`0.2` tracks the latest v0.2 patch; `0.2.0` is this release. Clients still
+send `Authorization: Bearer` per request. Optional env: `LEXE_NETWORK`,
+`LEXE_PAY_MAX_SATS`, and `LEXE_CLIENT_CREDENTIALS` (single-user fallback —
+pass it at runtime, do not bake it into an image).
+
 ## systemd (user unit, no sudo)
 
 ```bash

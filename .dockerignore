@@ -1,0 +1,10 @@
+.git
+.github
+config.json
+config.env
+.env
+lexe-mcp
+lexe-mcp-linux
+*.log
+docs
+systemd

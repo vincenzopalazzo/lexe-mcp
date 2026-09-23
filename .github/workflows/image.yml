@@ -1,0 +1,54 @@
+name: image
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: smoke
+        run: |
+          docker build -t lexe-mcp:smoke .
+          docker run -d --name lexe-mcp-smoke -p 18010:8010 lexe-mcp:smoke
+          trap 'docker rm -f lexe-mcp-smoke >/dev/null' EXIT
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            curl -sf -m 1 http://127.0.0.1:18010/health && break
+            sleep 0.3
+          done
+          curl -sf -m 3 http://127.0.0.1:18010/health | tee /tmp/health.json
+          grep -q '"service":"lexe-mcp"' /tmp/health.json
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
