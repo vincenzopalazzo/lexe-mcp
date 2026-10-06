@@ -118,7 +118,6 @@ func envIntOrFileInt(env string, fileVal any, def int) int {
 
 // ---------- config load ----------
 
-
 func envOr(env string, fileVal any) string {
 	if e := os.Getenv(env); e != "" {
 		return e
@@ -326,11 +325,11 @@ type bufConn struct {
 	c net.Conn
 }
 
-func (b bufConn) Read(p []byte) (int, error)  { return b.r.Read(p) }
-func (b bufConn) Write(p []byte) (int, error) { return b.c.Write(p) }
-func (b bufConn) Close() error                { return b.c.Close() }
-func (b bufConn) LocalAddr() net.Addr         { return b.c.LocalAddr() }
-func (b bufConn) RemoteAddr() net.Addr        { return b.c.RemoteAddr() }
+func (b bufConn) Read(p []byte) (int, error)         { return b.r.Read(p) }
+func (b bufConn) Write(p []byte) (int, error)        { return b.c.Write(p) }
+func (b bufConn) Close() error                       { return b.c.Close() }
+func (b bufConn) LocalAddr() net.Addr                { return b.c.LocalAddr() }
+func (b bufConn) RemoteAddr() net.Addr               { return b.c.RemoteAddr() }
 func (b bufConn) SetDeadline(t time.Time) error      { return b.c.SetDeadline(t) }
 func (b bufConn) SetReadDeadline(t time.Time) error  { return b.c.SetReadDeadline(t) }
 func (b bufConn) SetWriteDeadline(t time.Time) error { return b.c.SetWriteDeadline(t) }
@@ -685,7 +684,12 @@ func resolvePayAmount(picked map[string]any, requested, maxSats int) (int, error
 
 // analyzePaymentString decodes a payment string LOCALLY (the SDK's
 // analyze is client-side too). Kinds: invoice | offer | lnurl-pay | onchain.
+// A bitcoin: URI (BIP 21 / the body of a BIP 353 TXT record) is decoded here;
+// DNS resolution of the HRN happens in expandBIP353 before this is called.
 func analyzePaymentString(paymentString, _ string) (map[string]any, error) {
+	if m, ok, err := analyzeBitcoinURI(paymentString); ok {
+		return m, err
+	}
 	payable, kind := classifyPayable(paymentString)
 	if payable == "" {
 		return nil, httpError{"cannot classify that string as an invoice, offer, LNURL, or address"}
@@ -1053,10 +1057,10 @@ func createPayerProof(index, proofNote, creds string) (string, error) {
 		"index": index,
 		// Default disclosures, matching PayerProofDisclosures::default().
 		"disclosures": map[string]any{
-			"offer_description":   true,
-			"invreq_payer_note":   true,
-			"invoice_amount":      true,
-			"invoice_created_at":  true,
+			"offer_description":  true,
+			"invreq_payer_note":  true,
+			"invoice_amount":     true,
+			"invoice_created_at": true,
 		},
 	}
 	if proofNote != "" {
@@ -1165,7 +1169,7 @@ func buildTools() []map[string]any {
 		{
 			"name":        "lexe.analyze",
 			"title":       "Analyze invoice or offer",
-			"description": "Decode a BOLT11 invoice (lnbc…) or BOLT12 offer (lno1…) locally without sending. Returns amount/kind so you can inspect before lexe.pay. LNURL strings and Lightning addresses are recognized but not payable.",
+			"description": "Decode a BOLT11 invoice (lnbc…), BOLT12 offer (lno1…), or BIP 353 name (user@domain, ₿user@domain) without sending. BIP 353 names are resolved over DNSSEC to a bitcoin: URI. LNURL strings are recognized but not payable.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -1178,11 +1182,11 @@ func buildTools() []map[string]any {
 		{
 			"name":        "lexe.pay",
 			"title":       "Pay invoice or offer",
-			"description": "Pay a Lightning invoice or offer from the caller's Lexe node. Pass the BOLT11 (lnbc…) or BOLT12 offer (lno1…) string. Amountless strings need amount_sats. On-chain addresses and LNURL are refused. After a settled BOLT12 offer pay, also returns a payer proof (lnp1…) and proof_url on lnproof.space.",
+			"description": "Pay a Lightning invoice, BOLT12 offer, or BIP 353 name (user@domain, ₿user@domain) from the caller's Lexe node. BIP 353 names are resolved over DNSSEC to a BOLT12 offer or BOLT11 invoice, then paid. Amountless strings need amount_sats. On-chain addresses and LNURL are refused. After a settled BOLT12 offer pay, also returns a payer proof (lnp1…) and proof_url on lnproof.space.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"invoice":     map[string]any{"type": "string", "description": "BOLT11 invoice (lnbc…) or BOLT12 offer (lno1…)"},
+					"invoice":     map[string]any{"type": "string", "description": "BOLT11 invoice (lnbc…), BOLT12 offer (lno1…), or BIP 353 name (user@domain)"},
 					"offer":       map[string]any{"type": "string", "description": "Alias for invoice when paying a BOLT12 offer"},
 					"amount_sats": map[string]any{"type": "number", "description": "Sats to send. Required if the invoice/offer has no amount. Must match a fixed invoice amount."},
 					"note":        map[string]any{"type": "string", "description": "Personal note stored on the node, not sent to the receiver (<=200 chars)"},
@@ -1195,7 +1199,7 @@ func buildTools() []map[string]any {
 
 // callLexeTool dispatches one MCP tool call to the caller's Lexe node.
 // creds is the per-request Lexe SDK identity (empty → server config fallback).
-func callLexeTool(name string, args map[string]any, creds string) (any, error) {
+func callLexeTool(ctx context.Context, name string, args map[string]any, creds string) (any, error) {
 	switch name {
 	case "lexe.create_invoice":
 		if _, err := resolveCreds(creds); err != nil {
@@ -1238,6 +1242,10 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 		if s == "" {
 			return nil, httpError{"missing invoice/offer string"}
 		}
+		s, meta, err := expandBIP353(ctx, s)
+		if err != nil {
+			return nil, err
+		}
 		analyzed, err := analyzePaymentString(s, creds)
 		if err != nil {
 			return nil, err
@@ -1249,6 +1257,7 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 		} else {
 			out["payable"] = picked
 		}
+		attachBIP353(out, meta)
 		return out, nil
 	case "lexe.pay":
 		if _, err := resolveCreds(creds); err != nil {
@@ -1258,6 +1267,10 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 		if s == "" {
 			return nil, httpError{"missing invoice/offer: pass invoice or offer"}
 		}
+		s, meta, err := expandBIP353(ctx, s)
+		if err != nil {
+			return nil, err
+		}
 		analyzed, err := analyzePaymentString(s, creds)
 		if err != nil {
 			return nil, err
@@ -1265,6 +1278,11 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 		picked, err := pickLightningPayable(analyzed)
 		if err != nil {
 			return nil, err
+		}
+		if k := strings.ToLower(asString(picked["kind"])); meta != nil && (k == "lnurl-pay" || k == "lnurl") {
+			if msg := asString(meta["bip353_error"]); msg != "" {
+				return nil, httpError{msg + ". LNURL and Lightning-address payments are not supported — pass a BOLT11 invoice (lnbc…) or BOLT12 offer (lno1…)"}
+			}
 		}
 		amt, err := resolvePayAmount(picked, cfgInt(args["amount_sats"], 0), cfg.PayMaxSats)
 		if err != nil {
@@ -1292,6 +1310,7 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 			"kind":    kind,
 			"payment": p,
 		}
+		attachBIP353(out, meta)
 		if strings.EqualFold(kind, "offer") && paymentSettled(p) {
 			proof, perr := createPayerProof(idx, clipNote(asString(args["proof_note"])), creds)
 			if perr != nil {
@@ -1515,7 +1534,6 @@ func originAllowed(r *http.Request) bool {
 	return true
 }
 
-
 func handleMCP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1641,7 +1659,7 @@ func dispatchJSONRPC(r *http.Request, raw []byte) (any, int, bool) {
 				out = append(out, jsonRPCErr(id, -32602, "Invalid params: missing tool name", nil))
 				continue
 			}
-			res, err := callLexeTool(name, args, bearerLexe(r))
+			res, err := callLexeTool(r.Context(), name, args, bearerLexe(r))
 			if err != nil {
 				if strings.HasPrefix(err.Error(), "unknown tool") {
 					out = append(out, jsonRPCErr(id, -32602, err.Error(), nil))
@@ -1671,7 +1689,6 @@ func dispatchJSONRPC(r *http.Request, raw []byte) (any, int, bool) {
 	}
 	return out, httpStatus, true
 }
-
 
 func main() {
 	c := loadConfig()
