@@ -166,19 +166,23 @@ npx @modelcontextprotocol/inspector --transport http --url https://emailagent.he
 | Name | Args | Result |
 |---|---|---|
 | `lexe.create_invoice` | `description?`, `amount_sats?` | BOLT12 offer string |
-| `lexe.pay` | `invoice` or `offer`, `amount_sats?`, `note?`, `proof_note?` | `{settled, index, payment}` and, for settled offer pays, `proof` (`lnp1…`) + `proof_url` (`https://lnproof.space/lnp1…`) |
-| `lexe.analyze` | `invoice` or `offer` | local decode: amount/kind, no send, no identity needed |
+| `lexe.pay` | `invoice`, `offer`, or BIP 353 `user@domain`, `amount_sats?`, `note?`, `proof_note?` | `{settled, index, payment}` and, for settled offer pays, `proof` (`lnp1…`) + `proof_url` (`https://lnproof.space/lnp1…`) |
+| `lexe.analyze` | `invoice`, `offer`, or BIP 353 name | local decode, or DNSSEC resolution of a BIP 353 name to a `bitcoin:` URI. No send. No identity needed |
 | `lexe.check_payment` | `index` | `{settled, payment}` |
 | `lexe.node_health` | — | node info (version, balances, channels) over the gateway |
 
-`lexe.pay` analyzes locally first, refuses on-chain and LNURL, then calls
-the node `pay_invoice` / `pay_offer` and polls `payments/id` /
-`payments/updated` (250 ms → 4 s backoff, ~150 s cap) until
-`completed|failed`. Offer pays generate the `cid` client-side (32 random
+`lexe.pay` resolves a BIP 353 name first when the string is `user@domain`,
+`₿user@domain`, or `bitcoin:user@domain` (DNS-over-HTTPS to `dns.google`,
+then local DNSSEC validation back to the IANA root anchors — same shape as
+`bitcoin-payment-instructions` + `dnssec-prover`). It then analyzes locally,
+refuses on-chain and LNURL, and calls the node `pay_invoice` / `pay_offer`.
+It polls `payments/id` / `payments/updated` (250 ms → 4 s backoff, ~150 s cap)
+until `completed|failed`. Offer pays generate the `cid` client-side (32 random
 bytes) and mint a payer proof after settlement; a proof failure sets
 `proof_error` and does not undo the payment. Optional `payMaxSats` /
 `LEXE_PAY_MAX_SATS` (0 = no cap). Gateway/node failures and missing
-identity are `isError: true` results, not JSON-RPC errors.
+identity are `isError: true` results, not JSON-RPC errors. There is no LNURL
+fallback when BIP 353 resolution fails.
 
 Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 `resultType: "complete"` + `content[]` + `structuredContent`.
@@ -187,8 +191,11 @@ Modern `tools/call` must send `Mcp-Name` matching `params.name`. Results are
 
 | Path | Role |
 |---|---|
-| `server.go` | the whole server (MCP layer + direct gateway client) |
+| `server.go` | MCP layer + direct gateway client |
+| `bip353.go` | BIP 353 HRN resolution and `bitcoin:` URI decode |
+| `dnssec.go` | RFC 9102 proof builder and DNSSEC validation |
 | `server_test.go` | unit tests (amounts, classification, index format) |
+| `bip353_test.go` | BIP 353 / DNSSEC tests, including one live HRN lookup |
 | `gateway_test.go` | hermetic fake-gateway + fake-node TLS integration tests |
 | `go.mod` | `module github.com/vincenzopalazzo/lexe-mcp`, Go 1.23, no require |
 | `config.example.json` | committed skeleton |

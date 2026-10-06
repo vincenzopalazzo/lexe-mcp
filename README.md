@@ -25,8 +25,8 @@ MCP client ── Streamable HTTP ──▶ lexe-mcp ── TLS+CONNECT+mTLS ─
 | Tool | What it does |
 |---|---|
 | `lexe.create_invoice` | Create a reusable BOLT12 offer (min amount in sats) |
-| `lexe.pay` | Pay a BOLT11 invoice (`lnbc…`) or BOLT12 offer (`lno1…`). Settled offer pays also return a payer proof + `https://lnproof.space/lnp1…` |
-| `lexe.analyze` | Decode an invoice/offer locally without sending |
+| `lexe.pay` | Pay a BOLT11 invoice (`lnbc…`), BOLT12 offer (`lno1…`), or [BIP 353](https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki) name (`user@domain`, `₿user@domain`). Settled offer pays also return a payer proof + `https://lnproof.space/lnp1…` |
+| `lexe.analyze` | Decode an invoice/offer, or resolve a BIP 353 name, without sending |
 | `lexe.check_payment` | Look up a payment by index; report settled or not |
 | `lexe.node_health` | Your node's info (version, balances, channels) over the gateway |
 
@@ -157,7 +157,13 @@ Header/body mismatches → `400` + `-32020`. Unknown protocol version → `400` 
   of the sidecar health ping.
 - LNURL and Lightning-address strings are recognized by `lexe.analyze` but
   refused by `lexe.pay` — resolve them to a BOLT11 invoice first.
-- `lexe.analyze` is a local decode; it no longer requires an identity.
+  A `user@domain` string is tried as [BIP 353](https://github.com/bitcoin/bips/blob/master/bip-0353.mediawiki)
+  first (DNSSEC TXT at `user.user._bitcoin-payment.domain`, validated locally
+  the way `dnssec-prover` does). On success it pays the BOLT12 offer or BOLT11
+  invoice in the `bitcoin:` URI. There is no LNURL fallback.
+- `lexe.analyze` does not require an identity. BIP 353 resolution uses DNS-over-HTTPS
+  to `dns.google` and checks the signatures here; the resolver is not trusted to
+  validate DNSSEC.
 
 ## Docker
 
