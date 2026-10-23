@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -117,7 +118,6 @@ func envIntOrFileInt(env string, fileVal any, def int) int {
 }
 
 // ---------- config load ----------
-
 
 func envOr(env string, fileVal any) string {
 	if e := os.Getenv(env); e != "" {
@@ -326,11 +326,11 @@ type bufConn struct {
 	c net.Conn
 }
 
-func (b bufConn) Read(p []byte) (int, error)  { return b.r.Read(p) }
-func (b bufConn) Write(p []byte) (int, error) { return b.c.Write(p) }
-func (b bufConn) Close() error                { return b.c.Close() }
-func (b bufConn) LocalAddr() net.Addr         { return b.c.LocalAddr() }
-func (b bufConn) RemoteAddr() net.Addr        { return b.c.RemoteAddr() }
+func (b bufConn) Read(p []byte) (int, error)         { return b.r.Read(p) }
+func (b bufConn) Write(p []byte) (int, error)        { return b.c.Write(p) }
+func (b bufConn) Close() error                       { return b.c.Close() }
+func (b bufConn) LocalAddr() net.Addr                { return b.c.LocalAddr() }
+func (b bufConn) RemoteAddr() net.Addr               { return b.c.RemoteAddr() }
 func (b bufConn) SetDeadline(t time.Time) error      { return b.c.SetDeadline(t) }
 func (b bufConn) SetReadDeadline(t time.Time) error  { return b.c.SetReadDeadline(t) }
 func (b bufConn) SetWriteDeadline(t time.Time) error { return b.c.SetWriteDeadline(t) }
@@ -563,6 +563,411 @@ func getPayment(index string, creds string) (map[string]any, error) {
 		return p, nil
 	}
 	return nil, errPaymentNotFound
+}
+
+// Gateway page size for GET /user/v1/payments/updated. Tests shrink this
+// so a short fixture still exercises the cursor.
+var (
+	paymentsFetchLimit = 100
+	paymentsMaxScan    = 10000
+)
+
+// paymentUpdatedIndex formats the exclusive cursor "u<19-digit updated_at>-<id>".
+func paymentUpdatedIndex(p map[string]any) string {
+	if p == nil {
+		return ""
+	}
+	id := asString(p["id"])
+	if id == "" {
+		return ""
+	}
+	updated := toInt64(p["updated_at"])
+	if updated == 0 {
+		return ""
+	}
+	return fmt.Sprintf("u%019d-%s", updated, id)
+}
+
+func parseSats(v any) (*big.Rat, bool) {
+	if v == nil {
+		return nil, false
+	}
+	var s string
+	switch n := v.(type) {
+	case string:
+		s = strings.TrimSpace(n)
+	case json.Number:
+		s = n.String()
+	case float64:
+		s = strconv.FormatFloat(n, 'f', -1, 64)
+	case int:
+		s = strconv.Itoa(n)
+	case int64:
+		s = strconv.FormatInt(n, 10)
+	default:
+		return nil, false
+	}
+	if s == "" {
+		return nil, false
+	}
+	r := new(big.Rat)
+	if _, ok := r.SetString(s); !ok {
+		return nil, false
+	}
+	return r, true
+}
+
+// formatSats renders a satoshi amount without trailing zeros. Fractional
+// sats (millisatoshi precision) are preserved.
+func formatSats(r *big.Rat) string {
+	if r == nil || r.Sign() == 0 {
+		return "0"
+	}
+	s := r.FloatString(8)
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	}
+	if s == "" || s == "-" || s == "-0" {
+		return "0"
+	}
+	return s
+}
+
+func satsField(v any) any {
+	if v == nil {
+		return nil
+	}
+	if r, ok := parseSats(v); ok {
+		return formatSats(r)
+	}
+	if s, ok := v.(string); ok {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			return s
+		}
+	}
+	return nil
+}
+
+func firstPresent(m map[string]any, keys ...string) any {
+	for _, k := range keys {
+		if v, ok := m[k]; ok && v != nil {
+			return v
+		}
+	}
+	return nil
+}
+
+// projectPayment is the read-only view returned by lexe.list_payments.
+// Amounts stay satoshi strings so fractional sats survive JSON numbers.
+func projectPayment(p map[string]any) map[string]any {
+	id := asString(p["id"])
+	created := toInt64(p["created_at"])
+	var finalized any
+	if v, ok := p["finalized_at"]; ok && v != nil {
+		finalized = toInt64(v)
+	}
+	return map[string]any{
+		"index":        paymentIndex(created, id),
+		"id":           id,
+		"direction":    strings.ToLower(asString(p["direction"])),
+		"status":       strings.ToLower(asString(p["status"])),
+		"kind":         strings.ToLower(asString(p["kind"])),
+		"amount_sats":  satsField(p["amount"]),
+		"fees":         satsField(firstPresent(p, "fees", "fee")),
+		"created_at":   created,
+		"finalized_at": finalized,
+		"payer_note":   firstString(p, "payer_note", "message"),
+		"note":         firstString(p, "note", "personal_note"),
+	}
+}
+
+type paymentQuery struct {
+	direction string
+	status    string
+	since     *int64
+	until     *int64
+	note      string
+}
+
+func paymentMatches(p map[string]any, q paymentQuery) bool {
+	if q.direction != "" && strings.ToLower(asString(p["direction"])) != q.direction {
+		return false
+	}
+	if q.status != "" && strings.ToLower(asString(p["status"])) != q.status {
+		return false
+	}
+	created := toInt64(p["created_at"])
+	if q.since != nil && created < *q.since {
+		return false
+	}
+	if q.until != nil && created > *q.until {
+		return false
+	}
+	if q.note == "" {
+		return true
+	}
+	payer := strings.ToLower(firstString(p, "payer_note", "message"))
+	note := strings.ToLower(firstString(p, "note", "personal_note"))
+	return strings.Contains(payer, q.note) || strings.Contains(note, q.note)
+}
+
+func asBool(v any) bool {
+	switch n := v.(type) {
+	case bool:
+		return n
+	case string:
+		switch strings.ToLower(strings.TrimSpace(n)) {
+		case "1", "true", "yes":
+			return true
+		}
+	case float64:
+		return n != 0
+	case int:
+		return n != 0
+	}
+	return false
+}
+
+// parseTimeArg accepts unix milliseconds, RFC3339, or YYYY-MM-DD (UTC).
+// endOfDay makes a date-only value cover that whole UTC day.
+func parseTimeArg(v any, endOfDay bool) (*int64, error) {
+	if v == nil {
+		return nil, nil
+	}
+	switch n := v.(type) {
+	case float64:
+		i := int64(n)
+		return &i, nil
+	case int:
+		i := int64(n)
+		return &i, nil
+	case int64:
+		return &n, nil
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			return nil, httpError{"invalid time (use unix milliseconds, RFC3339, or YYYY-MM-DD)"}
+		}
+		return &i, nil
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return nil, nil
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return &i, nil
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			i := t.UnixMilli()
+			return &i, nil
+		}
+		if t, err := time.Parse("2006-01-02", s); err == nil {
+			if endOfDay {
+				t = t.Add(24*time.Hour - time.Millisecond)
+			}
+			i := t.UnixMilli()
+			return &i, nil
+		}
+		return nil, httpError{"invalid time (use unix milliseconds, RFC3339, or YYYY-MM-DD)"}
+	default:
+		return nil, httpError{"invalid time (use unix milliseconds, RFC3339, or YYYY-MM-DD)"}
+	}
+}
+
+func normalizeDirectionFilter(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "inbound", "outbound", "info":
+		return s, nil
+	default:
+		return "", httpError{"direction must be inbound or outbound"}
+	}
+}
+
+func normalizeStatusFilter(s string) (string, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch s {
+	case "", "pending", "completed", "failed":
+		return s, nil
+	case "settled", "paid":
+		return "completed", nil
+	default:
+		return "", httpError{"status must be pending, completed, or failed"}
+	}
+}
+
+func parsePaymentListArgs(args map[string]any) (paymentQuery, int, bool, string, error) {
+	direction, err := normalizeDirectionFilter(asString(args["direction"]))
+	if err != nil {
+		return paymentQuery{}, 0, false, "", err
+	}
+	status, err := normalizeStatusFilter(asString(args["status"]))
+	if err != nil {
+		return paymentQuery{}, 0, false, "", err
+	}
+	since, err := parseTimeArg(args["since"], false)
+	if err != nil {
+		return paymentQuery{}, 0, false, "", err
+	}
+	until, err := parseTimeArg(args["until"], true)
+	if err != nil {
+		return paymentQuery{}, 0, false, "", err
+	}
+	if since != nil && until != nil && *since > *until {
+		return paymentQuery{}, 0, false, "", httpError{"until is before since"}
+	}
+	limit := 50
+	if args["limit"] != nil {
+		limit = cfgInt(args["limit"], -1)
+		if limit <= 0 {
+			return paymentQuery{}, 0, false, "", httpError{"limit must be a positive number"}
+		}
+		if limit > 200 {
+			limit = 200
+		}
+	}
+	start := strings.TrimSpace(asString(args["start_index"]))
+	if start != "" && (!strings.HasPrefix(start, "u") || !strings.Contains(start[1:], "-")) {
+		return paymentQuery{}, 0, false, "", httpError{"start_index must be an updated cursor u<updated_at>-<id>"}
+	}
+	q := paymentQuery{
+		direction: direction,
+		status:    status,
+		since:     since,
+		until:     until,
+		note:      strings.ToLower(strings.TrimSpace(asString(args["payer_note"]))),
+	}
+	return q, limit, asBool(args["summary"]), start, nil
+}
+
+func paymentsFromUpdated(out any) ([]map[string]any, error) {
+	var items []any
+	switch v := out.(type) {
+	case []any:
+		items = v
+	case map[string]any:
+		raw, ok := v["payments"]
+		if !ok || raw == nil {
+			return []map[string]any{}, nil
+		}
+		items = asSlice(raw)
+		if items == nil {
+			return nil, httpError{"node payments/updated: unexpected payments field"}
+		}
+	default:
+		if out == nil {
+			return []map[string]any{}, nil
+		}
+		return nil, httpError{"node payments/updated: unexpected response"}
+	}
+	page := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		p := asMap(item)
+		if p == nil {
+			continue
+		}
+		page = append(page, p)
+	}
+	return page, nil
+}
+
+// fetchUpdatedPayments is GET-only. lexe.list_payments must not grow a
+// write call beside this.
+func fetchUpdatedPayments(creds, start string) ([]map[string]any, error) {
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(paymentsFetchLimit))
+	if start != "" {
+		q.Set("start_index", start)
+	}
+	out, err := nodeCall("GET", "/user/v1/payments/updated?"+q.Encode(), nil, 30000, creds)
+	if err != nil {
+		return nil, err
+	}
+	return paymentsFromUpdated(out)
+}
+
+// listPayments pages the caller's payment history. It only GETs
+// /user/v1/payments/updated — it never pays or moves funds.
+func listPayments(args map[string]any, creds string) (map[string]any, error) {
+	q, limit, summary, cursor, err := parsePaymentListArgs(args)
+	if err != nil {
+		return nil, err
+	}
+	scanned := 0
+	matched := 0
+	sum := new(big.Rat)
+	payments := []map[string]any{}
+	exhausted := false
+	truncated := false
+	stoppedEarly := false
+
+	for scanned < paymentsMaxScan && !stoppedEarly && !exhausted {
+		page, err := fetchUpdatedPayments(creds, cursor)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			exhausted = true
+			break
+		}
+		for i, raw := range page {
+			next := paymentUpdatedIndex(raw)
+			if next == "" || next == cursor {
+				return nil, httpError{"payments/updated cursor did not advance"}
+			}
+			cursor = next
+			scanned++
+			if paymentMatches(raw, q) {
+				if r, ok := parseSats(raw["amount"]); ok {
+					sum.Add(sum, r)
+				}
+				matched++
+				if !summary {
+					payments = append(payments, projectPayment(raw))
+				}
+			}
+			moreInPage := i < len(page)-1
+			pageFull := len(page) == paymentsFetchLimit
+			hitLimit := !summary && matched >= limit
+			hitScan := scanned >= paymentsMaxScan
+			if hitLimit || hitScan {
+				if moreInPage || pageFull {
+					stoppedEarly = true
+					if hitScan {
+						truncated = true
+					}
+				}
+				break
+			}
+		}
+		if stoppedEarly {
+			break
+		}
+		if len(page) < paymentsFetchLimit {
+			exhausted = true
+			break
+		}
+	}
+	if !exhausted && scanned >= paymentsMaxScan {
+		truncated = true
+	}
+
+	out := map[string]any{
+		"ok":        true,
+		"count":     matched,
+		"scanned":   scanned,
+		"truncated": truncated,
+	}
+	if !exhausted {
+		out["next_start_index"] = cursor
+	}
+	if summary {
+		out["amount_sats"] = formatSats(sum)
+		return out, nil
+	}
+	out["payments"] = payments
+	return out, nil
 }
 
 func asSlice(v any) []any {
@@ -1053,10 +1458,10 @@ func createPayerProof(index, proofNote, creds string) (string, error) {
 		"index": index,
 		// Default disclosures, matching PayerProofDisclosures::default().
 		"disclosures": map[string]any{
-			"offer_description":   true,
-			"invreq_payer_note":   true,
-			"invoice_amount":      true,
-			"invoice_created_at":  true,
+			"offer_description":  true,
+			"invreq_payer_note":  true,
+			"invoice_amount":     true,
+			"invoice_created_at": true,
 		},
 	}
 	if proofNote != "" {
@@ -1157,6 +1562,24 @@ func buildTools() []map[string]any {
 			},
 		},
 		{
+			"name":        "lexe.list_payments",
+			"title":       "List payment history",
+			"description": "Read-only page through the caller's payment history. Never sends or moves funds. Each payment includes index, id, direction, status, amount_sats (sats string; fractional sats allowed), fees (sats), created_at, finalized_at, payer_note, and note. Filters: direction (inbound|outbound), status (pending|completed|failed), since/until on created_at (unix ms, RFC3339, or YYYY-MM-DD), and payer_note (case-insensitive substring of payer_note or note). summary=true returns count and the summed amount_sats instead of the list. Pass next_start_index back as start_index to continue.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"direction":   map[string]any{"type": "string", "description": "inbound or outbound"},
+					"status":      map[string]any{"type": "string", "description": "pending, completed, or failed"},
+					"since":       map[string]any{"description": "Include payments created at or after this time (unix milliseconds, RFC3339, or YYYY-MM-DD UTC)"},
+					"until":       map[string]any{"description": "Include payments created at or before this time (unix milliseconds, RFC3339, or YYYY-MM-DD UTC). A date covers that whole UTC day."},
+					"payer_note":  map[string]any{"type": "string", "description": "Case-insensitive substring matched against payer_note or note"},
+					"summary":     map[string]any{"type": "boolean", "description": "Return count and summed amount_sats instead of the payment list"},
+					"limit":       map[string]any{"type": "number", "description": "Max payments to return (default 50, max 200). Ignored when summary is true."},
+					"start_index": map[string]any{"type": "string", "description": "Exclusive updated-index cursor (u<updated_at>-<id>) from a previous next_start_index"},
+				},
+			},
+		},
+		{
 			"name":        "lexe.node_health",
 			"title":       "Lexe node health",
 			"description": "The caller's Lexe node info (version, balances, channels) fetched over the Lexe gateway. Requires the caller's identity.",
@@ -1227,6 +1650,8 @@ func callLexeTool(name string, args map[string]any, creds string) (any, error) {
 			return nil, err
 		}
 		return map[string]any{"ok": true, "settled": paymentSettled(p), "payment": p}, nil
+	case "lexe.list_payments":
+		return listPayments(args, creds)
 	case "lexe.node_health":
 		out, err := nodeCall("GET", "/user/v2/node_info", nil, 30000, creds)
 		if err != nil {
@@ -1515,7 +1940,6 @@ func originAllowed(r *http.Request) bool {
 	return true
 }
 
-
 func handleMCP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -1671,7 +2095,6 @@ func dispatchJSONRPC(r *http.Request, raw []byte) (any, int, bool) {
 	}
 	return out, httpStatus, true
 }
-
 
 func main() {
 	c := loadConfig()

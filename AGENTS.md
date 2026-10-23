@@ -169,7 +169,14 @@ npx @modelcontextprotocol/inspector --transport http --url https://emailagent.he
 | `lexe.pay` | `invoice` or `offer`, `amount_sats?`, `note?`, `proof_note?` | `{settled, index, payment}` and, for settled offer pays, `proof` (`lnp1…`) + `proof_url` (`https://lnproof.space/lnp1…`) |
 | `lexe.analyze` | `invoice` or `offer` | local decode: amount/kind, no send, no identity needed |
 | `lexe.check_payment` | `index` | `{settled, payment}` |
+| `lexe.list_payments` | `direction?`, `status?`, `since?`, `until?`, `payer_note?`, `summary?`, `limit?`, `start_index?` | read-only history. Each payment has `index`, `id`, `direction`, `status`, `amount_sats`, `fees`, `created_at`, `finalized_at`, `payer_note`, `note`. `summary: true` returns `count` and summed `amount_sats` |
 | `lexe.node_health` | — | node info (version, balances, channels) over the gateway |
+
+`lexe.list_payments` only `GET`s `/user/v1/payments/updated`. It never
+calls a pay endpoint. `payer_note` matches `payer_note` or `note`
+case-insensitively. `since`/`until` apply to `created_at`. Summary
+mode (`summary: true` with `direction: inbound`, `status: completed`,
+`payer_note: "OCEAN lightning payout"`) totals those inbound payouts.
 
 `lexe.pay` analyzes locally first, refuses on-chain and LNURL, then calls
 the node `pay_invoice` / `pay_offer` and polls `payments/id` /

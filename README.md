@@ -28,6 +28,7 @@ MCP client ── Streamable HTTP ──▶ lexe-mcp ── TLS+CONNECT+mTLS ─
 | `lexe.pay` | Pay a BOLT11 invoice (`lnbc…`) or BOLT12 offer (`lno1…`). Settled offer pays also return a payer proof + `https://lnproof.space/lnp1…` |
 | `lexe.analyze` | Decode an invoice/offer locally without sending |
 | `lexe.check_payment` | Look up a payment by index; report settled or not |
+| `lexe.list_payments` | Read-only payment history (filters + optional amount summary). Never sends |
 | `lexe.node_health` | Your node's info (version, balances, channels) over the gateway |
 
 Hosted instance: [`https://emailagent.hedwig.sh/mcp`](https://emailagent.hedwig.sh/mcp).
@@ -173,6 +174,40 @@ curl -sS localhost:8010/health
 send `Authorization: Bearer` per request. Optional env: `LEXE_NETWORK`,
 `LEXE_PAY_MAX_SATS`, and `LEXE_CLIENT_CREDENTIALS` (single-user fallback —
 pass it at runtime, do not bake it into an image).
+
+## Payment history
+
+`lexe.list_payments` pages `GET /user/v1/payments/updated` and does not
+pay or move funds. Amounts are sats strings (fractional sats allowed).
+Pass `summary: true` to total matches instead of listing them.
+
+OCEAN pool payouts — inbound, completed, payer note contains
+`OCEAN lightning payout`:
+
+```json
+{
+  "direction": "inbound",
+  "status": "completed",
+  "payer_note": "OCEAN lightning payout",
+  "summary": true
+}
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "amount_sats": "3000.5",
+  "scanned": 5,
+  "truncated": false
+}
+```
+
+`payer_note` is a case-insensitive substring of the payer note or the
+personal note. `since` / `until` filter on `created_at` (unix
+milliseconds, RFC3339, or `YYYY-MM-DD`). A list response includes
+`next_start_index` when more history remains; pass it back as
+`start_index`.
 
 ## systemd (user unit, no sudo)
 
