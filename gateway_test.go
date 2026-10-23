@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,11 @@ type fakeStack struct {
 	payPolls int
 	lastBody map[string]any
 	lastPath string
+	reqs     []string
+	// history, when set, is the full payment list in updated_at order.
+	// GET /user/v1/payments/updated pages it. The invoice-poll prefix
+	// still returns the single pay_invoice fixture.
+	history []any
 }
 
 func (f *fakeStack) record(r *http.Request) {
@@ -89,6 +95,28 @@ func newFakeStack(t *testing.T) *fakeStack {
 	})
 	nodeMux.HandleFunc("/user/v1/payments/updated", func(w http.ResponseWriter, r *http.Request) {
 		start := r.URL.Query().Get("start_index")
+		fs.mu.Lock()
+		history := fs.history
+		fs.mu.Unlock()
+		if history != nil && !strings.HasPrefix(start, "u0000000000000000455-") {
+			limit := paymentsFetchLimit
+			if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 {
+				limit = n
+			}
+			out := make([]any, 0, limit)
+			for _, item := range history {
+				idx := paymentUpdatedIndex(asMap(item))
+				if start != "" && (idx == "" || idx <= start) {
+					continue
+				}
+				out = append(out, item)
+				if len(out) >= limit {
+					break
+				}
+			}
+			writeTestJSON(w, map[string]any{"payments": out})
+			return
+		}
 		if !strings.HasPrefix(start, "u0000000000000000455-") {
 			writeTestJSON(w, map[string]any{"payments": []any{}})
 			return
@@ -96,6 +124,7 @@ func newFakeStack(t *testing.T) *fakeStack {
 		writeTestJSON(w, map[string]any{"payments": []any{map[string]any{
 			"id": "ln_abc", "status": "completed", "created_at": 456,
 			"direction": "outbound", "kind": "invoice", "amount": "1000",
+			"updated_at": 456,
 		}}})
 	})
 	nodeMux.HandleFunc("/user/v1/payments/id", func(w http.ResponseWriter, r *http.Request) {
@@ -132,10 +161,15 @@ func newFakeStack(t *testing.T) *fakeStack {
 	ephPool := x509.NewCertPool()
 	ephPool.AddCert(ephCA.cert)
 	go func() {
-		_ = (&http.Server{Handler: nodeMux}).Serve(tls.NewListener(nodeLn, &tls.Config{
+		_ = (&http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fs.mu.Lock()
+			fs.reqs = append(fs.reqs, r.Method+" "+r.URL.Path)
+			fs.mu.Unlock()
+			nodeMux.ServeHTTP(w, r)
+		})}).Serve(tls.NewListener(nodeLn, &tls.Config{
 			Certificates: []tls.Certificate{{Certificate: [][]byte{nodeCert.raw}, PrivateKey: nodeKey}},
 			ClientAuth:   tls.RequireAndVerifyClientCert, // forces the client cert
-			ClientCAs:    ephPool,                         // forces eph-CA-signed client
+			ClientCAs:    ephPool,                        // forces eph-CA-signed client
 			MinVersion:   tls.VersionTLS12,
 			NextProtos:   []string{"http/1.1"},
 		}))
@@ -403,4 +437,201 @@ func TestMissingIdentity(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "missing Lexe identity") {
 		t.Fatalf("got %v", err)
 	}
+}
+
+func oceanHistory() []any {
+	return []any{
+		map[string]any{
+			"id": "ln_ocean1", "direction": "inbound", "status": "completed", "kind": "invoice",
+			"amount": "1000.5", "fees": "1",
+			"created_at": int64(1700000001000), "finalized_at": int64(1700000001500), "updated_at": int64(1700000001500),
+			"payer_note": "OCEAN lightning payout",
+		},
+		map[string]any{
+			"id": "ln_coffee", "direction": "outbound", "status": "completed", "kind": "invoice",
+			"amount": "21", "fees": "0",
+			"created_at": int64(1700000002000), "finalized_at": int64(1700000002000), "updated_at": int64(1700000002000),
+			"note": "coffee",
+		},
+		map[string]any{
+			"id": "ln_ocean2", "direction": "inbound", "status": "pending", "kind": "invoice",
+			"amount": "500", "fees": "0",
+			"created_at": int64(1700000003000), "updated_at": int64(1700000003000),
+			"payer_note": "OCEAN lightning payout",
+		},
+		map[string]any{
+			"id": "ln_ocean3", "direction": "Inbound", "status": "completed", "kind": "offer",
+			"amount": "2000", "fees": "2.5",
+			"created_at": int64(1700000004000), "finalized_at": int64(1700000004500), "updated_at": int64(1700000004500),
+			"message": "ocean lightning payout extra",
+		},
+		map[string]any{
+			"id": "ln_other", "direction": "inbound", "status": "completed", "kind": "invoice",
+			"amount": "9", "fee": "0",
+			"created_at": int64(1700000005000), "finalized_at": int64(1700000005000), "updated_at": int64(1700000005000),
+			"payer_note": "thanks", "personal_note": "not a pool payout",
+		},
+		map[string]any{
+			"id": "ln_noted", "direction": "inbound", "status": "completed", "kind": "invoice",
+			"amount": "0.5", "fees": "0",
+			"created_at": int64(1700000006000), "finalized_at": int64(1700000006000), "updated_at": int64(1700000006000),
+			"personal_note": "OCEAN lightning payout manual",
+		},
+	}
+}
+
+func TestListPaymentsReadOnlySummary(t *testing.T) {
+	withFakeStack(t, func(t *testing.T, fs *fakeStack) {
+		oldFetch, oldScan := paymentsFetchLimit, paymentsMaxScan
+		paymentsFetchLimit = 2
+		paymentsMaxScan = 10000
+		t.Cleanup(func() {
+			paymentsFetchLimit, paymentsMaxScan = oldFetch, oldScan
+		})
+		fs.mu.Lock()
+		fs.history = oceanHistory()
+		before := len(fs.reqs)
+		fs.mu.Unlock()
+
+		args := map[string]any{
+			"direction":  "inbound",
+			"status":     "completed",
+			"payer_note": "OCEAN lightning payout",
+			"summary":    true,
+		}
+		out, err := listPayments(args, fs.blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out["count"] != 3 || out["amount_sats"] != "3001" {
+			t.Fatalf("summary = %#v", out)
+		}
+		if out["truncated"] != false {
+			t.Fatalf("truncated = %#v", out["truncated"])
+		}
+		if _, ok := out["next_start_index"]; ok {
+			t.Fatalf("history exhausted but next_start_index set: %#v", out)
+		}
+		if _, ok := out["payments"]; ok {
+			t.Fatal("summary mode returned payments")
+		}
+
+		fs.mu.Lock()
+		reqs := append([]string(nil), fs.reqs[before:]...)
+		fs.mu.Unlock()
+		if len(reqs) < 3 {
+			t.Fatalf("expected multiple pages, got %v", reqs)
+		}
+		for _, req := range reqs {
+			if req != "GET /user/v1/payments/updated" {
+				t.Fatalf("list_payments called %q; only GET payments/updated is allowed", req)
+			}
+		}
+
+		// since the third match (created_at 1700000004000) through the note-only one
+		args["since"] = "2023-11-14T22:13:24Z" // 1700000004000
+		out, err = listPayments(args, fs.blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out["count"] != 2 || out["amount_sats"] != "2000.5" {
+			t.Fatalf("since summary = %#v", out)
+		}
+	})
+}
+
+func TestListPaymentsPageAndProject(t *testing.T) {
+	withFakeStack(t, func(t *testing.T, fs *fakeStack) {
+		oldFetch := paymentsFetchLimit
+		paymentsFetchLimit = 2
+		t.Cleanup(func() { paymentsFetchLimit = oldFetch })
+		fs.mu.Lock()
+		fs.history = oceanHistory()
+		fs.mu.Unlock()
+
+		out, err := listPayments(map[string]any{
+			"direction":  "inbound",
+			"status":     "completed",
+			"payer_note": "ocean lightning payout",
+			"limit":      1,
+		}, fs.blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pays, _ := out["payments"].([]map[string]any)
+		if len(pays) != 1 || out["count"] != 1 {
+			t.Fatalf("first page = %#v", out)
+		}
+		p := pays[0]
+		if p["id"] != "ln_ocean1" || p["direction"] != "inbound" || p["status"] != "completed" {
+			t.Fatalf("payment = %#v", p)
+		}
+		if p["amount_sats"] != "1000.5" || p["fees"] != "1" {
+			t.Fatalf("amounts = %#v", p)
+		}
+		if p["payer_note"] != "OCEAN lightning payout" || p["note"] != "" {
+			t.Fatalf("notes = %#v", p)
+		}
+		if p["created_at"] != int64(1700000001000) || p["finalized_at"] != int64(1700000001500) {
+			t.Fatalf("times = %#v", p)
+		}
+		wantIdx := paymentIndex(1700000001000, "ln_ocean1")
+		if p["index"] != wantIdx {
+			t.Fatalf("index = %v want %s", p["index"], wantIdx)
+		}
+		next := asString(out["next_start_index"])
+		if next == "" || !strings.HasPrefix(next, "u") {
+			t.Fatalf("next_start_index = %q", next)
+		}
+
+		rest, err := listPayments(map[string]any{
+			"direction":   "inbound",
+			"status":      "completed",
+			"payer_note":  "OCEAN lightning payout",
+			"start_index": next,
+		}, fs.blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		restPays, _ := rest["payments"].([]map[string]any)
+		if rest["count"] != 2 || len(restPays) != 2 {
+			t.Fatalf("rest = %#v", rest)
+		}
+		if restPays[0]["id"] != "ln_ocean3" || restPays[0]["payer_note"] != "ocean lightning payout extra" {
+			t.Fatalf("alias message not projected: %#v", restPays[0])
+		}
+		if restPays[1]["id"] != "ln_noted" || restPays[1]["note"] != "OCEAN lightning payout manual" {
+			t.Fatalf("personal_note not projected: %#v", restPays[1])
+		}
+	})
+}
+
+func TestListPaymentsScanCap(t *testing.T) {
+	withFakeStack(t, func(t *testing.T, fs *fakeStack) {
+		oldFetch, oldScan := paymentsFetchLimit, paymentsMaxScan
+		paymentsFetchLimit = 2
+		paymentsMaxScan = 3
+		t.Cleanup(func() {
+			paymentsFetchLimit, paymentsMaxScan = oldFetch, oldScan
+		})
+		fs.mu.Lock()
+		fs.history = oceanHistory()
+		fs.mu.Unlock()
+
+		out, err := listPayments(map[string]any{"summary": true}, fs.blob)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out["truncated"] != true || out["scanned"] != 3 {
+			t.Fatalf("cap = %#v", out)
+		}
+		if asString(out["next_start_index"]) == "" {
+			t.Fatal("expected next_start_index when the scan cap stops early")
+		}
+		// Unfiltered summary of the first three rows: 1000.5 + 21 + 500.
+		// ocean3 (2000) is past the cap.
+		if out["count"] != 3 || out["amount_sats"] != "1521.5" {
+			t.Fatalf("partial summary = %#v", out)
+		}
+	})
 }

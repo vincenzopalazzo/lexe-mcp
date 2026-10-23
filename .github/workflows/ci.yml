@@ -49,9 +49,16 @@ jobs:
           grep -q 'lexe.create_invoice' /tmp/tools.json
           grep -q 'lexe.pay' /tmp/tools.json
           grep -q 'lexe.analyze' /tmp/tools.json
+          grep -q 'lexe.list_payments' /tmp/tools.json
 
           curl -sf -m 3 -H 'content-type: application/json' \
             -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lexe.pay","arguments":{"invoice":"lnbc1ci"}}}' \
             http://127.0.0.1:18010/mcp | tee /tmp/pay.json
           grep -q 'missing Lexe identity' /tmp/pay.json
           grep -q '"isError":true' /tmp/pay.json
+
+          curl -sf -m 3 -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"lexe.list_payments","arguments":{"summary":true,"direction":"inbound","status":"completed","payer_note":"OCEAN lightning payout"}}}' \
+            http://127.0.0.1:18010/mcp | tee /tmp/list.json
+          grep -q 'missing Lexe identity' /tmp/list.json
+          grep -q '"isError":true' /tmp/list.json
